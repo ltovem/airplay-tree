@@ -11,7 +11,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  # ------------------------------------------------------------------
+  # 桌面三件套（本地原生构建 + 示例构建）
+  # ------------------------------------------------------------------
+  desktop:
     name: ${{ matrix.config.name }} (${{ matrix.build_type }})
     runs-on: ${{ matrix.config.os }}
     strategy:
@@ -31,10 +34,9 @@ jobs:
             cc: gcc
             cxx: g++
             examples: ON
-            # libavahi is optional; build without for simplicity in this CI
-            cmake_extra: '-DCMAKE_CXX_FLAGS="-DAIRPLAY2_USE_AVAHI=0"'
+            cmake_extra: '-DAIRPLAY2_USE_AVAHI=0'
 
-          - name: Windows (MSVC)
+          - name: Windows (MSVC x64)
             os: windows-latest
             cc: cl
             cxx: cl
@@ -72,14 +74,12 @@ jobs:
       - name: Build
         shell: bash
         working-directory: ${{ github.workspace }}
-        run: |
-          cmake --build build --config ${{ matrix.build_type }} --parallel 3
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel 3
 
       - name: Install (package verification)
         shell: bash
         working-directory: ${{ github.workspace }}
-        run: |
-          cmake --install build --config ${{ matrix.build_type }} || true
+        run: cmake --install build --config ${{ matrix.build_type }} || true
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -95,10 +95,146 @@ jobs:
             build/**/*.exe
           if-no-files-found: ignore
 
+  # ------------------------------------------------------------------
+  # iOS 交叉构建（真机 arm64 + 模拟器 x86_64 / arm64）
+  # ------------------------------------------------------------------
+  ios:
+    name: iOS ${{ matrix.sdk.platform }} (${{ matrix.sdk.arch }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk:
+          - { platform: 'OS',         arch: 'arm64',    sdk: 'iphoneos',       deploy: '12.0' }
+          - { platform: 'SIMULATOR',  arch: 'x86_64',   sdk: 'iphonesimulator',deploy: '12.0' }
+          - { platform: 'SIMULATOR',  arch: 'arm64',    sdk: 'iphonesimulator',deploy: '12.0' }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Xcode SDK availability
+        run: xcodebuild -showsdks | grep -E 'iphone|iphonesimulator' || true
+
+      - name: Configure CMake (iOS)
+        run: |
+          cmake -S . -B build-ios \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=build-ios/install \
+              -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain-iOS.cmake \
+              -DIOS_PLATFORM=${{ matrix.sdk.platform }} \
+              -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.sdk.arch }} \
+              -DCMAKE_OSX_ARCHITECTURES=${{ matrix.sdk.arch }} \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.sdk.deploy }} \
+              -DIPHONEOS_DEPLOYMENT_TARGET=${{ matrix.sdk.deploy }} \
+              -DAIRPLAY2_BUILD_EXAMPLES=OFF
+
+      - name: Build (iOS)
+        run: cmake --build build-ios --config Release --parallel 3
+
+      - name: Upload iOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: airplay2lib-iOS-${{ matrix.sdk.platform }}-${{ matrix.sdk.arch }}
+          path: |
+            build-ios/libairplay2*
+            build-ios/install/**
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # Android NDK 交叉构建（三大常见 ABI）
+  # ------------------------------------------------------------------
+  android:
+    name: Android ${{ matrix.abi }} (API ${{ matrix.api }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { abi: 'armeabi-v7a', api: 21 }
+          - { abi: 'arm64-v8a',   api: 21 }
+          - { abi: 'x86_64',      api: 21 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NDK & build tools
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: true
+          link: ${{ github.workspace }}/ndk
+
+      - name: Configure CMake (Android)
+        run: |
+          export ANDROID_NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          cmake -S . -B build-android \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=build-android/install \
+              -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain-Android.cmake \
+              -DANDROID_ABI=${{ matrix.abi }} \
+              -DANDROID_PLATFORM=android-${{ matrix.api }} \
+              -DANDROID_NDK="${ANDROID_NDK}" \
+              -DAIRPLAY2_BUILD_EXAMPLES=OFF
+
+      - name: Build (Android)
+        run: cmake --build build-android --config Release --parallel 3
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: airplay2lib-Android-${{ matrix.abi }}-api${{ matrix.api }}
+          path: |
+            build-android/libairplay2*
+            build-android/install/**
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # Linux ARM64 (aarch64) 交叉构建
+  # ------------------------------------------------------------------
+  linux-arm64:
+    name: Linux aarch64 (cross GCC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install aarch64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+              build-essential cmake ninja-build \
+              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Configure CMake (aarch64 cross)
+        run: |
+          cmake -S . -B build-arm64 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=build-arm64/install \
+              -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchain-Linux-aarch64.cmake
+
+      - name: Build (aarch64 cross)
+        run: cmake --build build-arm64 --config Release --parallel 3
+
+      - name: Verify ELF architecture
+        run: |
+          file build-arm64/libairplay2.a 2>/dev/null || true
+          # 若有共享库，也可检测 .so
+          find build-arm64 -name "*.a" -o -name "*.so*" | while read f; do
+              echo "$f ->"; file "$f"; done
+
+      - name: Upload Linux ARM64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: airplay2lib-Linux-aarch64
+          path: |
+            build-arm64/libairplay2*
+            build-arm64/install/**
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # Linux 内存 + 未定义行为消毒（额外的质量保障）
+  # ------------------------------------------------------------------
   sanitize-linux:
     name: Linux ASan + UBSan
     runs-on: ubuntu-latest
-    needs: build
+    needs: [ desktop ]
     steps:
       - uses: actions/checkout@v4
       - name: Install deps

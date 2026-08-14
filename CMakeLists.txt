@@ -76,6 +76,10 @@ target_include_directories(airplay2
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# 可选：Linux mDNS 后端选择（Avahi 或 内置零依赖 UDP）
+option(AIRPLAY2_USE_AVAHI "Use libavahi-client on Linux (requires apt install libavahi-client-dev)" ON)
+mark_as_advanced(AIRPLAY2_USE_AVAHI)
+
 # 平台链接库
 if(AP2_WINDOWS)
     target_link_libraries(airplay2 PRIVATE ws2_32 iphlpapi)
@@ -95,8 +99,18 @@ elseif(AP2_MACOS OR AP2_IOS)
     endif()
 elseif(AP2_ANDROID)
     target_link_libraries(airplay2 PRIVATE log)
-else() # Linux
-    target_link_libraries(airplay2 PRIVATE pthread avahi-client avahi-common)
+else() # Linux / POSIX generic
+    target_link_libraries(airplay2 PRIVATE pthread)
+    if(AIRPLAY2_USE_AVAHI)
+        find_library(AVAHI_CLIENT_LIBRARY avahi-client)
+        find_library(AVAHI_COMMON_LIBRARY avahi-common)
+        if(AVAHI_CLIENT_LIBRARY AND AVAHI_COMMON_LIBRARY)
+            target_link_libraries(airplay2 PRIVATE ${AVAHI_CLIENT_LIBRARY} ${AVAHI_COMMON_LIBRARY})
+            target_compile_definitions(airplay2 PRIVATE AIRPLAY2_USE_AVAHI=1)
+        else()
+            message(WARNING "AIRPLAY2_USE_AVAHI=ON but libavahi-client not found; falling back to built-in UDP mDNS responder.")
+        endif()
+    endif()
 endif()
 
 # 构建示例
