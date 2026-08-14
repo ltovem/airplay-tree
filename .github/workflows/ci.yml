@@ -1,0 +1,117 @@
+name: CI Build
+
+on:
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.config.name }} (${{ matrix.build_type }})
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [ Release ]
+        config:
+          - name: macOS (AppleClang)
+            os: macos-latest
+            cc: clang
+            cxx: clang++
+            examples: ON
+            cmake_extra: ''
+
+          - name: Ubuntu (GCC)
+            os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+            examples: ON
+            # libavahi is optional; build without for simplicity in this CI
+            cmake_extra: '-DCMAKE_CXX_FLAGS="-DAIRPLAY2_USE_AVAHI=0"'
+
+          - name: Windows (MSVC)
+            os: windows-latest
+            cc: cl
+            cxx: cl
+            examples: ON
+            cmake_extra: '-G "Visual Studio 17 2022" -A x64'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+              build-essential cmake ninja-build \
+              libavahi-client-dev libavahi-common-dev || true
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja || true
+
+      - name: Configure CMake
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          export CC=${{ matrix.config.cc }}
+          export CXX=${{ matrix.config.cxx }}
+          cmake -S . -B build \
+              -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+              -DAIRPLAY2_BUILD_EXAMPLES=${{ matrix.config.examples }} \
+              -DCMAKE_INSTALL_PREFIX=build/install \
+              ${{ matrix.config.cmake_extra }}
+
+      - name: Build
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          cmake --build build --config ${{ matrix.build_type }} --parallel 3
+
+      - name: Install (package verification)
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          cmake --install build --config ${{ matrix.build_type }} || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: airplay2lib-${{ matrix.config.name }}-${{ matrix.build_type }}
+          path: |
+            build/libairplay2*
+            build/airplay2*
+            build/examples/airplay2*
+            build/install/**
+            build/**/*.lib
+            build/**/*.dll
+            build/**/*.exe
+          if-no-files-found: ignore
+
+  sanitize-linux:
+    name: Linux ASan + UBSan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+      - name: Configure (Sanitizers)
+        run: |
+          cmake -S . -B build-san \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+              -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+              -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" \
+              -DAIRPLAY2_BUILD_EXAMPLES=ON
+      - name: Build Sanitizers
+        run: cmake --build build-san --parallel 3

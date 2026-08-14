@@ -1,0 +1,16 @@
+/*!
+ * @file version.h
+ * @brief airplay2lib version information
+ */
+#ifndef AIRPLAY2_VERSION_H
+#define AIRPLAY2_VERSION_H
+
+#define AIRPLAY2_VERSION_MAJOR 1
+#define AIRPLAY2_VERSION_MINOR 0
+#define AIRPLAY2_VERSION_PATCH 0
+#define AIRPLAY2_VERSION_STRING "1.0.0"
+
+#define AIRPLAY2_MAKE_VERSION(maj, min, pat) ((maj) * 10000 + (min) * 100 + (pat))
+#define AIRPLAY2_VERSION AIRPLAY2_MAKE_VERSION(AIRPLAY2_VERSION_MAJOR, AIRPLAY2_VERSION_MINOR, AIRPLAY2_VERSION_PATCH)
+
+#endif // AIRPLAY2_VERSION_H

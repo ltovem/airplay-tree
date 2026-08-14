@@ -1,0 +1,78 @@
+# ---- CMake build directories ----
+build/
+build-*/
+out/
+cmake-build-*/
+Build/
+Builds/
+
+# ---- Compiled object files & static/shared libraries ----
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.dSYM/
+
+# ---- IDE / Editor files ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.user
+*.suo
+*.sln.docstates
+
+# ---- Xcode ----
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+
+# ---- Visual Studio ----
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+Debug/
+Release/
+x64/
+x86/
+Win32/
+ipch/
+*.sdf
+*.opensdf
+*.log
+*.tlog
+
+# ---- CMake generated ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+cmake_uninstall.cmake
+install_manifest.txt
+Testing/
+CTestTestfile.cmake
+compile_commands.json
+compile_flags.txt
+.clangd/
+.cache/
+
+# ---- Temporary / Logs ----
+*.tmp
+*.temp
+*.log
+logs/
