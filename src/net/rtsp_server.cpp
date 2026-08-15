@@ -27,16 +27,50 @@ static std::vector<std::string> split_lines(const std::string& s) {
     }
     return out;
 }
+/// 按 sep 切分字符串，兼容 fmtp / plist URL kv 列表
+static std::vector<std::string> split_lines_and(const std::string& s, char sep = ';') {
+    std::vector<std::string> out;
+    size_t start = 0;
+    for (size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == sep) {
+            std::string p = s.substr(start, i - start);
+            while (!p.empty() && (p.front() == ' ' || p.front() == '\t')) p.erase(p.begin());
+            while (!p.empty() && (p.back() == ' ' || p.back() == '\t')) p.pop_back();
+            if (!p.empty()) out.push_back(p);
+            start = i + 1;
+        }
+    }
+    return out;
+}
 
+/*!
+ * @brief 解析 AirPlay 2 SDP（支持 m=audio 和 m=video 双媒体行）
+ *
+ * AirPlay SDP 一般格式：
+ *   v=0
+ *   o=AppleID ...
+ *   s=...
+ *   c=IN IP4 0.0.0.0
+ *   t=0 0
+ *   m=audio 49152 RTP/AVP 96
+ *   a=rtpmap:96 AppleLossless/44100/2
+ *   a=fmtp:96 ...
+ *   m=video 49170 RTP/AVP 97
+ *   a=rtpmap:97 H264/90000
+ *   a=fmtp:97 profile-level-id=42e01f;sprop-parameter-sets=...
+ *   ...
+ */
 bool parse_sdp(const std::string& sdp, SdpInfo& out) {
     auto lines = split_lines(sdp);
+    std::string current_media = "";   // "audio" / "video" / ""
+    int current_pt_audio = 96;
+    int current_pt_video = 97;
     for (auto& line : lines) {
         if (line.size() < 2 || line[1] != '=') continue;
         char type = line[0];
         std::string val = line.substr(2);
         switch (type) {
             case 'o': {
-                // o=- <session_id> ...
                 size_t p1 = val.find(' ');
                 if (p1 != std::string::npos) {
                     size_t p2 = val.find(' ', p1 + 1);
@@ -46,8 +80,8 @@ bool parse_sdp(const std::string& sdp, SdpInfo& out) {
                 break;
             }
             case 'm': {
-                // m=audio <port_min>-<port_max> RTP/AVP 96
                 if (val.compare(0, 5, "audio") == 0) {
+                    current_media = "audio";
                     size_t p1 = val.find(' ');
                     if (p1 != std::string::npos) {
                         size_t p2 = val.find(' ', p1 + 1);
@@ -61,14 +95,22 @@ bool parse_sdp(const std::string& sdp, SdpInfo& out) {
                         } else {
                             try { out.server_port_min = out.server_port_max = std::stoi(ports); } catch (...) {}
                         }
-                        // Look for payload type
                         if (p2 != std::string::npos) {
                             size_t p3 = val.rfind(' ');
                             if (p3 != std::string::npos && p3 > p2) {
-                                try { out.audio_pt = std::stoi(val.substr(p3 + 1)); } catch (...) {}
+                                try { out.audio_pt = current_pt_audio = std::stoi(val.substr(p3 + 1)); } catch (...) {}
                             }
                         }
                     }
+                } else if (val.compare(0, 5, "video") == 0) {
+                    current_media = "video";
+                    out.has_video = true;
+                    size_t p3 = val.rfind(' ');
+                    if (p3 != std::string::npos) {
+                        try { out.video_pt = current_pt_video = std::stoi(val.substr(p3 + 1)); } catch (...) {}
+                    }
+                } else {
+                    current_media = "";
                 }
                 break;
             }
@@ -76,15 +118,41 @@ bool parse_sdp(const std::string& sdp, SdpInfo& out) {
                 size_t eq = val.find(':');
                 std::string key = (eq == std::string::npos) ? val : val.substr(0, eq);
                 std::string vv  = (eq == std::string::npos) ? ""  : val.substr(eq + 1);
-                // 去掉 key 里冒号前的 payload-type 后缀，例如 "fmtp:96" / "rtpmap:96"
                 std::string base_key = key;
                 size_t col = base_key.find(':');
-                if (col != std::string::npos) base_key = base_key.substr(0, col);
+                int pt_filter = -1;       // 若 rtpmap:97 / fmtp:96 带了 PT，则做过滤
+                if (col != std::string::npos) {
+                    std::string pt_s = base_key.substr(col + 1);
+                    base_key = base_key.substr(0, col);
+                    try { pt_filter = std::stoi(pt_s); } catch (...) {}
+                }
                 if (base_key == "rtpmap") {
-                    // a=rtpmap:96 AppleLossless/44100/2
+                    // 按 PT 判断归属到音频或视频
                     size_t sp = vv.find(' ');
-                    if (sp != std::string::npos) {
-                        std::string codec_def = vv.substr(sp + 1);
+                    if (sp == std::string::npos) break;
+                    std::string codec_def = vv.substr(sp + 1);
+                    bool is_video = (pt_filter == current_pt_video)
+                                 || (pt_filter == -1 && current_media == "video");
+                    if (is_video) {
+                        size_t s1 = codec_def.find('/');
+                        if (s1 != std::string::npos) {
+                            std::string codec_name = codec_def.substr(0, s1);
+                            std::string lower_name; lower_name.resize(codec_name.size());
+                            std::transform(codec_name.begin(), codec_name.end(), lower_name.begin(), ::tolower);
+                            if (lower_name.find("h265") != std::string::npos || lower_name.find("hevc") != std::string::npos) {
+                                out.video_codec = VideoCodec::H265_HEVC;
+                            } else if (lower_name.find("jpeg") != std::string::npos) {
+                                out.video_codec = VideoCodec::MJPEG;
+                            } else {
+                                out.video_codec = VideoCodec::H264_AVC;
+                            }
+                            size_t s2 = codec_def.find('/', s1 + 1);
+                            try {
+                                out.video_clock = std::stoi(codec_def.substr(s1 + 1,
+                                    (s2 == std::string::npos ? std::string::npos : s2 - (s1 + 1))));
+                            } catch (...) {}
+                        }
+                    } else {
                         size_t s1 = codec_def.find('/');
                         if (s1 != std::string::npos) {
                             out.audio_mode = codec_def.substr(0, s1);
@@ -96,21 +164,44 @@ bool parse_sdp(const std::string& sdp, SdpInfo& out) {
                         }
                     }
                 } else if (base_key == "fmtp") {
-                    out.fmtp = vv;
+                    bool to_video = (pt_filter == current_pt_video)
+                                 || (pt_filter == -1 && current_media == "video");
+                    if (to_video) {
+                        out.video_fmtp = vv;
+                        // 简单提取 width / height (x-dim-width / framesize)
+                        for (auto kv : split_lines_and(vv, ';')) {
+                            if (kv.find("framesize:") != std::string::npos) {
+                                // framesize:97 1920-1080
+                                size_t sp0 = kv.find(' ');
+                                if (sp0 != std::string::npos) {
+                                    std::string dim = kv.substr(sp0 + 1);
+                                    size_t dash0 = dim.find('-');
+                                    if (dash0 != std::string::npos) {
+                                        try {
+                                            out.video_width = std::stoi(dim.substr(0, dash0));
+                                            out.video_height = std::stoi(dim.substr(dash0 + 1));
+                                        } catch (...) {}
+                                    }
+                                }
+                            } else if (kv.find("x-framerate:") != std::string::npos) {
+                                size_t e = kv.find(':');
+                                if (e != std::string::npos) {
+                                    try { out.video_fps = std::stoi(kv.substr(e + 1)); } catch (...) {}
+                                }
+                            }
+                        }
+                    } else {
+                        out.fmtp = vv;
+                    }
                 } else if (base_key == "control") {
                     // a=control:rtsp://.../sessionid
                 } else if (base_key == "ts-clk" || base_key == "ts-refclk") {
                     try { out.rtp_time_base = std::stoull(vv); } catch (...) {}
                 } else if (base_key == "aeskey") {
-                    // a=aeskey:<hex>  — AirTunes/AirPlay 明文 hex 16 字节 AES-128 key
                     out.aes_key = vv;
                 } else if (base_key == "aesiv") {
-                    // a=aesiv:<hex> — 16 字节初始 IV / counter
                     out.aes_iv = vv;
                 } else if (base_key == "es-charset" || base_key == "es-parameters") {
-                    // 某些发送端会把 aeskey 放在 es-parameters 里，
-                    // 若 aes_key 还没填充就尝试从这里拿，key=value 形式。
-                    // 简化：只在 aes_key/aes_iv 仍空时扫一下 aeskey= 片段
                     if (out.aes_key.empty()) {
                         size_t p = vv.find("aeskey=");
                         if (p != std::string::npos) {
@@ -127,11 +218,12 @@ bool parse_sdp(const std::string& sdp, SdpInfo& out) {
                             out.aes_iv = vv.substr(s, (e == std::string::npos ? std::string::npos : e - s));
                         }
                     }
+                } else if (base_key == "range") {
+                    // 存在时意味着 sender 支持 HLS URL 拉流（airplay play 接口）
                 }
                 break;
             }
             case 'c': {
-                // c=IN IP4 192.168.1.5
                 if (val.compare(0, 7, "IN IP4 ") == 0) {
                     out.source_ip = val.substr(7);
                 }
@@ -139,7 +231,7 @@ bool parse_sdp(const std::string& sdp, SdpInfo& out) {
             }
         }
     }
-    return !out.session_id.empty() || out.sample_rate > 0;
+    return !out.session_id.empty() || out.sample_rate > 0 || out.has_video;
 }
 
 // ---- Minimal plist helpers for /info (XML-style, not binary) ----
@@ -430,6 +522,104 @@ void RtspServer::install_routes(const DeviceInfo& dev) {
         }
         return make_rtsp_ok(req.cseq());
     }, true);
+
+    // ---- Video / URL playback ----
+    // POST /play — 视频播放请求：body 是 binary plist，包含 Content-Location/Start-Position
+    http_.add_route("POST", "/play", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        util::PlistValue dict;
+        if (!req.body.empty()) util::parse_plist(req.body.data(), req.body.size(), dict);
+        std::vector<uint8_t> resp_body;
+        if (handlers_.on_play_url) {
+            resp_body = handlers_.on_play_url(c.id(), dict, req.body.data(), req.body.size());
+        }
+        HeaderMap extra;
+        extra["Session"] = "airplay2lib-" + std::to_string(c.id());
+        if (!resp_body.empty())
+            extra["Content-Type"] = "application/x-apple-binary-plist";
+        return make_rtsp_ok(req.cseq(), extra, std::move(resp_body));
+    }, false);
+
+    // POST /stop — 停止 URL 拉流
+    http_.add_route("POST", "/stop", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        if (handlers_.on_stop) handlers_.on_stop(c.id());
+        return make_rtsp_ok(req.cseq());
+    }, false);
+
+    // POST /scrub — seek (header: position=<seconds>)
+    http_.add_route("POST", "/scrub", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        std::string p = req.header("position");
+        if (p.empty()) p = req.header("Position");
+        double pos = 0.0;
+        try { if (!p.empty()) pos = std::stod(p); } catch (...) {}
+        if (handlers_.on_scrub) handlers_.on_scrub(c.id(), pos);
+        return make_rtsp_ok(req.cseq());
+    }, false);
+
+    // GET /scrub — 返回当前播放位置
+    http_.add_route("GET", "/scrub", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        double pos = 0.0;
+        if (handlers_.on_get_scrub_pos) pos = handlers_.on_get_scrub_pos(c.id());
+        char tbuf[64];
+        std::snprintf(tbuf, sizeof(tbuf), "duration: 0.000\nposition: %.3f\n", pos);
+        std::string body(tbuf);
+        std::vector<uint8_t> b(body.begin(), body.end());
+        HeaderMap extra; extra["Content-Type"] = "text/parameters";
+        return make_rtsp_ok(req.cseq(), extra, std::move(b));
+    }, false);
+
+    // PUT /reverse — 镜像翻转控制（header value=0/1/2）
+    http_.add_route("PUT", "/reverse", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        std::string v = req.header("value");
+        int mode = 0;
+        try { if (!v.empty()) mode = std::stoi(v); } catch (...) {}
+        if (handlers_.on_reverse) handlers_.on_reverse(c.id(), mode);
+        return make_rtsp_ok(req.cseq());
+    }, false);
+
+    // PUT /setProperty — body: name=value
+    http_.add_route("PUT", "/setProperty", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        std::string name = req.header("if");
+        if (name.empty()) name = req.header("If");
+        std::vector<uint8_t> val = req.body;
+        if (handlers_.on_set_property) handlers_.on_set_property(c.id(), name, val);
+        return make_rtsp_ok(req.cseq());
+    }, true);
+
+    // GET /getProperty — 以 ?if=xxx 或 path?name=xxx
+    http_.add_route("GET", "/getProperty", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        std::string name = req.header("if");
+        if (name.empty()) name = req.header("If");
+        // HttpRequest 没有单独的 query() 接口；uri 形如 /getProperty?if=volume
+        const std::string& uri = req.uri;
+        size_t qmark = uri.find('?');
+        if (name.empty() && qmark != std::string::npos) {
+            std::string q = uri.substr(qmark + 1);
+            size_t eq = q.find("if=");
+            size_t adv = 0;
+            if (eq != std::string::npos) adv = 3;
+            else { eq = q.find("name="); if (eq != std::string::npos) adv = 5; }
+            if (eq != std::string::npos) name = q.substr(eq + adv);
+        }
+        std::vector<uint8_t> body;
+        if (handlers_.on_get_property) body = handlers_.on_get_property(c.id(), name);
+        HeaderMap extra; extra["Content-Type"] = "application/octet-stream";
+        return make_rtsp_ok(req.cseq(), extra, std::move(body));
+    }, true);
+
+    // PUT /photo — 上传照片投射
+    http_.add_route("PUT", "/photo", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        if (handlers_.on_photo_upload) {
+            handlers_.on_photo_upload(c.id(), req.body, req.header("Content-Type"));
+        }
+        return make_rtsp_ok(req.cseq());
+    }, false);
+    // POST /photo — 某些发送端用 POST
+    http_.add_route("POST", "/photo", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        if (handlers_.on_photo_upload) {
+            handlers_.on_photo_upload(c.id(), req.body, req.header("Content-Type"));
+        }
+        return make_rtsp_ok(req.cseq());
+    }, false);
 
     // Default handler
     http_.set_default_handler([this](const HttpRequest& req, Connection& c) -> HttpResponse {

@@ -6,11 +6,14 @@
 
 #include "../include/airplay2/airplay_session.h"
 #include "../include/airplay2/audio_renderer.h"
+#include "../include/airplay2/video_renderer.h"
 #include "../net/rtp_receiver.h"
 #include "../net/rtsp_server.h"
+#include "../net/video_rtp.h"
 #include "../codec/alac_decoder.h"
 #include "../codec/audio_buffer.h"
 #include "../platform/platform_thread.h"
+#include "fairplay.h"
 #include <cstdint>
 #include <atomic>
 #include <memory>
@@ -24,7 +27,8 @@ class ServerImpl;
 class SessionImpl {
 public:
     explicit SessionImpl(uint64_t id, ServerImpl* server,
-                         IAudioRenderer* renderer);
+                         IAudioRenderer* audio_renderer,
+                         IVideoRenderer* video_renderer = nullptr);
     ~SessionImpl();
 
     uint64_t id() const { return id_; }
@@ -32,6 +36,7 @@ public:
     std::string client_address() const { return client_addr_; }
     std::string client_name()   const { return client_name_; }
     AudioConfig audio_config()  const { return audio_cfg_; }
+    VideoConfig video_config()  const { return video_cfg_; }
 
     void set_client(const std::string& ip, const std::string& ua) {
         client_addr_ = ip; client_name_ = ua;
@@ -40,44 +45,72 @@ public:
     SessionStats stats() const;
 
     // ---- RTP / codec lifecycle ----
-    /// Allocate RTP ports given range; fills ports[3] and returns true
+    /// Allocate audio RTP ports (data/ctrl/timing); fills ports[3]
     bool allocate_ports(int remote_ports[3], uint16_t port_min, uint16_t port_max,
                         int local_ports[3]);
+    /// Allocate a video data port; returns 0 on fail
+    uint16_t allocate_video_port(uint16_t port_min, uint16_t port_max,
+                                  int remote_data_port = 0);
 
-    /// Configure audio codec (called after ANNOUNCE SDP parsing)
+    /// Configure audio / video codec (after ANNOUNCE SDP parsing)
     void configure_audio(const net::SdpInfo& sdp);
+    void configure_video(const net::SdpInfo& sdp);
 
-    /// Start the RTP receiver + playback thread
+    /// Start both streams (RECORD response)
     void start_streaming();
+    /// Start only video stream (data push without audio)
+    void start_video_streaming();
 
-    /// Pause / resume / teardown
+    /// Playback commands
     void pause_streaming();
     void resume_streaming();
     void stop_streaming();
     void flush_buffers();
+    /// URL Pull 模式: 请求播放 URL
+    bool play_url(const VideoPlaybackCmd& cmd);
+    /// 速率控制
+    void set_rate(double rate);
+    /// Seek
+    void seek(double pos_sec);
 
     void disconnect() { stop_streaming(); state_.store(AirPlaySession::State::CLOSED); }
 
-    /// Volume control
-    void  set_volume(float v) { volume_.store(v); if (renderer_) renderer_->set_volume(v); }
+    /// Volume / renderer swap
+    void  set_volume(float v) { volume_.store(v); if (audio_renderer_) audio_renderer_->set_volume(v); }
     float get_volume() const { return volume_.load(); }
+    void set_video_renderer(IVideoRenderer* r) { video_renderer_ = r; }
+    void set_audio_renderer(IAudioRenderer* r) { audio_renderer_ = r; }
+
+    /// 当前播放位置（秒），用于 /scrub GET
+    double current_pos_sec() const { return current_pos_sec_.load(); }
+
+    /// 是否已配置视频（SDP 中含 m=video）
+    bool has_video() const { return video_local_port_ != 0 || video_cfg_.codec != VideoCodec::H264_AVC
+                                      || video_cfg_.width != 0 || video_cfg_.height != 0; }
+
+    /// FairPlay accessor
+    FairPlaySap& fairplay() { return fp_; }
 
 private:
     void on_rtp_packet(const net::RtpAudioPacket& pkt);
+    void on_video_frame(const VideoFrame& f);
     void playback_worker();
     void transition(AirPlaySession::State s) { state_.store(s); }
 
     uint64_t const id_;
     ServerImpl* server_ = nullptr;
-    IAudioRenderer* renderer_ = nullptr;
+    IAudioRenderer* audio_renderer_ = nullptr;
+    IVideoRenderer* video_renderer_ = nullptr;
     std::atomic<AirPlaySession::State> state_{AirPlaySession::State::IDLE};
 
     std::string client_addr_;
     std::string client_name_;
 
-    // Network
+    // Network: audio 3-port, video single data port
     net::RtpReceiver rtp_;
     int rtp_local_ports_[3] = {0,0,0};
+    net::VideoRtpReceiver video_rtp_;
+    uint16_t video_local_port_ = 0;
 
     // Audio pipeline
     codec::AlacDecoder alac_;
@@ -85,13 +118,25 @@ private:
     AudioConfig audio_cfg_;
     std::string codec_mode_;
     std::atomic<bool> playing_{false};
+    std::atomic<bool> video_playing_{false};
 
-    // Playback thread
+    // Video pipeline
+    VideoConfig video_cfg_;
+
+    // Playback thread (audio)
     platform::Thread playback_thread_;
     std::atomic<bool> playback_stop_{false};
 
     // Volume
     std::atomic<float> volume_{1.0f};
+
+    // Playback state
+    std::atomic<double> playback_rate_{1.0};
+    std::atomic<double> current_pos_sec_{0.0};
+    std::mutex video_cmd_mu_;
+
+    // FairPlay SAP
+    FairPlaySap fp_;
 
     // Stats
     mutable std::mutex stats_mu_;

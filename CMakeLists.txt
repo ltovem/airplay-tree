@@ -43,6 +43,7 @@ set(AIRPLAY2_PUBLIC_HEADERS
     include/airplay2/airplay_session.h
     include/airplay2/airplay_config.h
     include/airplay2/audio_renderer.h
+    include/airplay2/video_renderer.h
     include/airplay2/version.h
 )
 
@@ -59,13 +60,19 @@ set(AIRPLAY2_SOURCES
     src/net/rtp_receiver.cpp
     src/net/rtcp.cpp
     src/net/timing.cpp
+    src/net/video_rtp.cpp
     src/codec/alac_decoder.cpp
     src/codec/audio_buffer.cpp
+    src/codec/nal_reassembler.cpp
     src/crypto/aes_ctr.cpp
+    src/crypto/aes_cbc.cpp
+    src/crypto/sha512.cpp
+    src/crypto/curve25519.cpp
     src/util/plist.cpp
     src/core/airplay_server_impl.cpp
     src/core/airplay_session_impl.cpp
     src/core/airplay_pairing.cpp
+    src/core/fairplay.cpp
 )
 
 # 创建库目标

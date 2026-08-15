@@ -69,11 +69,13 @@ struct DeviceInfo {
     uint16_t    port     = 7000;            ///< AirPlay RTSP 控制端口（默认 7000；改了要同时改 ServerConfig）
     // 为什么是 32 位？：按 AirPlay 协议 feature 位已经超过 uint16
     // （bit24=has video、bit31=requires auth 等），必须用 uint32。
-    uint32_t    features = 0x5A7FFFF7;      ///< Feature flags 位图
+    // 0x5A7FFFF7 = 默认音频特性 + bit24(VIDEO)=1 + bit27(HAS_H264)=1
+    // + bit31(RQR_AUTH) 仍为 0（要认证请自行打开 + 配置证书）。
+    uint32_t    features = 0x5F7FFFF7;      ///< Feature flags 位图
     uint8_t     protocol_version = 1;       ///< AirPlay 协议版本：1 = AP1/AP2 兼容
     bool        supports_audio = true;      ///< 宣告支持音频（关闭后仅能做屏幕镜像接收器）
-    bool        supports_video = false;     ///< 宣告支持视频（当前库未实现视频解码，建议 false）
-    bool        supports_photo = false;     ///< 宣告支持照片投射（目前未实现）
+    bool        supports_video = true;      ///< 宣告支持视频（镜像 / HLS 拉流）
+    bool        supports_photo = true;      ///< 宣告支持照片投射
     bool        requires_encryption = false;///< 是否要求 FairPlay 加密（需要 MFi 证书，当前留 false）
     std::string pin_code;                   ///< 4 位数字 PIN；非空时每次配对要输入
 };

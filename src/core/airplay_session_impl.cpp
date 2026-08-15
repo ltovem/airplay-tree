@@ -9,8 +9,11 @@
 
 namespace airplay2 {
 
-SessionImpl::SessionImpl(uint64_t id, ServerImpl* server, IAudioRenderer* renderer)
-    : id_(id), server_(server), renderer_(renderer), pcm_buffer_(16384) {
+SessionImpl::SessionImpl(uint64_t id, ServerImpl* server,
+                         IAudioRenderer* audio_renderer, IVideoRenderer* video_renderer)
+    : id_(id), server_(server),
+      audio_renderer_(audio_renderer), video_renderer_(video_renderer),
+      pcm_buffer_(16384) {
     state_.store(AirPlaySession::State::CONNECTED);
 }
 
@@ -87,7 +90,7 @@ void SessionImpl::configure_audio(const net::SdpInfo& sdp) {
         }
     }
     pcm_buffer_.set_config(audio_cfg_);
-    if (renderer_) renderer_->on_config(audio_cfg_);
+    if (audio_renderer_) audio_renderer_->on_config(audio_cfg_);
     transition(AirPlaySession::State::READY);
 }
 
@@ -98,16 +101,22 @@ void SessionImpl::start_streaming() {
     rtp_.start();
     playback_thread_.start([this] { playback_worker(); }, "ap2-playback");
     playing_.store(true);
+    // 若会话已配置视频，也启动视频 RTP
+    if (video_local_port_ != 0) start_video_streaming();
     transition(AirPlaySession::State::PLAYING);
     if (session_start_us_ == 0) session_start_us_ = platform::time_now_us();
-    if (renderer_) renderer_->on_play();
+    if (audio_renderer_) audio_renderer_->on_play();
     AP2_LOGI("session %lu: playback started", (unsigned long)id_);
 }
 
 void SessionImpl::pause_streaming() {
     if (!playing_.exchange(false)) return;
     transition(AirPlaySession::State::PAUSED);
-    if (renderer_) renderer_->on_pause();
+    if (audio_renderer_) audio_renderer_->on_pause();
+    if (video_renderer_ && video_playing_.load()) {
+        VideoPlaybackCmd cmd; cmd.type = VideoPlaybackCmd::PAUSE;
+        video_renderer_->on_playback(cmd);
+    }
     AP2_LOGI("session %lu: paused", (unsigned long)id_);
 }
 
@@ -115,24 +124,33 @@ void SessionImpl::resume_streaming() {
     if (playing_.load()) return;
     transition(AirPlaySession::State::PLAYING);
     playing_.store(true);
-    if (renderer_) renderer_->on_play();
+    if (audio_renderer_) audio_renderer_->on_play();
+    if (video_renderer_ && video_playing_.load()) {
+        VideoPlaybackCmd cmd; cmd.type = VideoPlaybackCmd::PLAY;
+        cmd.rate = playback_rate_.load();
+        video_renderer_->on_playback(cmd);
+    }
 }
 
 void SessionImpl::stop_streaming() {
     playback_stop_.store(true);
     playing_.store(false);
+    video_playing_.store(false);
     rtp_.stop();
+    video_rtp_.stop();
     playback_thread_.stop_and_join();
-    if (renderer_) renderer_->on_stop();
+    if (audio_renderer_) audio_renderer_->on_stop();
+    if (video_renderer_) video_renderer_->on_stop();
     if (state_.load() != AirPlaySession::State::CLOSED)
         transition(AirPlaySession::State::IDLE);
 }
 
 void SessionImpl::flush_buffers() {
     rtp_.flush();
+    video_rtp_.flush();
     pcm_buffer_.flush();
     alac_.reset();
-    if (renderer_) renderer_->on_flush();
+    if (audio_renderer_) audio_renderer_->on_flush();
 }
 
 void SessionImpl::on_rtp_packet(const net::RtpAudioPacket& pkt) {
@@ -187,9 +205,9 @@ void SessionImpl::playback_worker() {
         if (avail >= want) {
             tmp.resize(want * bpf);
             size_t got = pcm_buffer_.read_frames(tmp.data(), want);
-            if (got > 0 && renderer_) {
+            if (got > 0 && audio_renderer_) {
                 size_t bytes = got * bpf;
-                renderer_->on_pcm(tmp.data(), bytes, platform::time_now_us());
+                audio_renderer_->on_pcm(tmp.data(), bytes, platform::time_now_us());
             }
         } else if (avail == 0) {
             platform::sleep_ms(10);
@@ -201,11 +219,101 @@ void SessionImpl::playback_worker() {
     }
     // Drain remaining on stop
     size_t remaining = pcm_buffer_.available_frames();
-    if (remaining > 0 && renderer_) {
+    if (remaining > 0 && audio_renderer_) {
         tmp.resize(remaining * bpf);
         size_t got = pcm_buffer_.read_frames(tmp.data(), remaining);
-        if (got > 0) renderer_->on_pcm(tmp.data(), got * bpf, platform::time_now_us());
+        if (got > 0) audio_renderer_->on_pcm(tmp.data(), got * bpf, platform::time_now_us());
     }
+}
+
+/* ================================================================
+ *                    Video port allocation / configure
+ * ================================================================ */
+uint16_t SessionImpl::allocate_video_port(uint16_t port_min, uint16_t port_max,
+                                           int remote_data_port) {
+    uint16_t p = 0;
+    if (!video_rtp_.open(port_min, port_max, p)) return 0;
+    video_local_port_ = p;
+    if (!client_addr_.empty() && remote_data_port > 0) {
+        video_rtp_.set_remote_address(client_addr_, remote_data_port);
+    }
+    return p;
+}
+
+void SessionImpl::configure_video(const net::SdpInfo& sdp) {
+    video_cfg_.codec = sdp.video_codec;
+    video_cfg_.width  = (uint32_t)sdp.video_width;
+    video_cfg_.height = (uint32_t)sdp.video_height;
+    video_cfg_.fps_num = (uint32_t)sdp.video_fps;
+    video_cfg_.fps_den = sdp.video_fps > 0 ? 1 : 0;
+    video_rtp_.set_codec(sdp.video_codec);
+
+    // 若 SDP video_fmtp 带 sprop-parameter-sets（H.264 SPS/PPS base64），解码保存
+    // 简化：把 fmtp 直接作为 codec_extra（调用方也可自行解析）
+    if (!sdp.video_fmtp.empty()) {
+        video_cfg_.codec_extra.assign(sdp.video_fmtp.begin(), sdp.video_fmtp.end());
+        video_rtp_.set_codec_data(video_cfg_.codec_extra);
+    }
+    // AES key 从同一 SDP 取（AirPlay 对音视频用同一把 key）
+    if (!sdp.aes_key.empty() || !sdp.aes_iv.empty()) {
+        video_rtp_.set_decryption_params(sdp.aes_key, sdp.aes_iv);
+    }
+    if (video_renderer_) video_renderer_->on_config(video_cfg_);
+    AP2_LOGI("session %lu: video codec=%s w=%d h=%d fps=%d",
+             (unsigned long)id_,
+             (sdp.video_codec==VideoCodec::H264_AVC)?"H264":
+             (sdp.video_codec==VideoCodec::H265_HEVC)?"H265":"MJPEG",
+             sdp.video_width, sdp.video_height, sdp.video_fps);
+}
+
+void SessionImpl::start_video_streaming() {
+    if (video_playing_.exchange(true)) return;
+    video_rtp_.set_frame_callback([this](const VideoFrame& f){ on_video_frame(f); });
+    video_rtp_.start();
+    if (video_renderer_) {
+        VideoPlaybackCmd c; c.type = VideoPlaybackCmd::PLAY; c.rate = playback_rate_.load();
+        video_renderer_->on_playback(c);
+    }
+}
+
+void SessionImpl::on_video_frame(const VideoFrame& f) {
+    current_pos_sec_ = (double)f.pts_us / 1e6;
+    if (video_renderer_) video_renderer_->on_frame(f);
+}
+
+/* ================================================================
+ *              Playback control / URL pull
+ * ================================================================ */
+bool SessionImpl::play_url(const VideoPlaybackCmd& cmd) {
+    current_pos_sec_ = cmd.start_pos_sec;
+    if (video_renderer_) {
+        return video_renderer_->on_url(cmd);
+    }
+    return true;
+}
+void SessionImpl::set_rate(double rate) {
+    playback_rate_.store(rate);
+    VideoPlaybackCmd cmd;
+    cmd.type = std::abs(rate) < 1e-9 ? VideoPlaybackCmd::PAUSE : VideoPlaybackCmd::PLAY;
+    cmd.rate = rate;
+    cmd.start_pos_sec = current_pos_sec_;
+    if (audio_renderer_) {
+        if (cmd.type == VideoPlaybackCmd::PAUSE) audio_renderer_->on_pause();
+        else audio_renderer_->on_play();
+    }
+    if (video_renderer_) video_renderer_->on_playback(cmd);
+    if (cmd.type == VideoPlaybackCmd::PAUSE) pause_streaming();
+    else {
+        auto s = state_.load();
+        if (s == AirPlaySession::State::PAUSED) resume_streaming();
+    }
+}
+void SessionImpl::seek(double pos_sec) {
+    current_pos_sec_ = pos_sec;
+    VideoPlaybackCmd cmd;
+    cmd.type = VideoPlaybackCmd::SEEK;
+    cmd.start_pos_sec = pos_sec;
+    if (video_renderer_) video_renderer_->on_playback(cmd);
 }
 
 } // namespace airplay2

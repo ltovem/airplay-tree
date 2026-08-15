@@ -10,6 +10,7 @@
 
 #include "http_server.h"
 #include "../include/airplay2/airplay_config.h"
+#include "../include/airplay2/video_renderer.h"
 #include <functional>
 #include <memory>
 #include <string>
@@ -25,6 +26,10 @@ namespace net {
 
 /*!
  * @brief Info about a parsed SDP from ANNOUNCE
+ *
+ * AirPlay 2 ANNOUNCE 里通常会包含多个 m= 行：
+ *   m=audio 0 RTP/AVP 96 — 音频（ALAC/AAC）
+ *   m=video 0 RTP/AVP 97 — 视频（H.264/H.265），屏幕镜像或投影片
  */
 struct SdpInfo {
     std::string session_id;
@@ -41,6 +46,16 @@ struct SdpInfo {
     std::string aes_key;             ///< hex-encoded AES key (if encrypted)
     std::string aes_iv;              ///< hex-encoded AES IV
     std::string source_ip;           ///< client source IP for RTP (if offered)
+
+    // ---- 视频 ----
+    bool        has_video = false;
+    int         video_pt = 97;       ///< H.264=96 或 H.265=98 由 SDP 决定
+    int         video_clock = 90000; ///< 视频固定 90 kHz
+    VideoCodec  video_codec = VideoCodec::H264_AVC;
+    std::string video_fmtp;          ///< H.264 profile-level-id / sprop-parameter-sets
+    int         video_width = 0;
+    int         video_height = 0;
+    int         video_fps = 0;
 };
 
 /// Parse SDP text into SdpInfo
@@ -111,6 +126,36 @@ struct RtspHandlers {
     // PUT /metadata / POST /metadata — 正在播放的曲目/封面信息（通常是 binary plist）
     std::function<void(uint64_t conn_id, const util::PlistValue& dict,
                        const uint8_t* raw, size_t raw_len)> on_metadata;
+
+    // ---- 视频 / URL 拉流 ----
+    // POST /play — AirPlay 视频/HLS 播放请求：body 是 binary plist，
+    //   带 Content-Location (URL) / Start-Position (0.0~1.0) / ...
+    //   返回值：可选 response body（空即可）
+    std::function<std::vector<uint8_t>(uint64_t conn_id, const util::PlistValue& dict,
+                                       const uint8_t* raw, size_t raw_len)> on_play_url;
+
+    // POST /stop — 停止 URL 拉流播放
+    std::function<void(uint64_t conn_id)> on_stop;
+
+    // POST /scrub — seek，header: position=<seconds>
+    std::function<void(uint64_t conn_id, double pos_sec)> on_scrub;
+
+    // GET  /scrub — 返回当前播放时间 "position: %.3f\n"
+    std::function<double(uint64_t conn_id)> on_get_scrub_pos;
+
+    // PUT /reverse — 控制镜像反向（可选）
+    std::function<void(uint64_t conn_id, int mode)> on_reverse;
+
+    // PUT /setProperty + GET /getProperty — 属性读写（volume / etc.）
+    std::function<void(uint64_t conn_id, const std::string& name,
+                       const std::vector<uint8_t>& value)> on_set_property;
+    std::function<std::vector<uint8_t>(uint64_t conn_id,
+                                       const std::string& name)> on_get_property;
+
+    // PUT /photo — 上传照片（照片投射），body 为 JPEG/PNG 二进制
+    //   第 2 参数为 Content-Type 头原始字符串
+    std::function<void(uint64_t conn_id, const std::vector<uint8_t>& jpeg_data,
+                       const std::string& content_type)> on_photo_upload;
 
     /// Fallback: allow embedding /play, /scrub, /property endpoints
     std::function<HttpResponse(const HttpRequest&, Connection&)> on_unknown;

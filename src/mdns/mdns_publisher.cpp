@@ -301,15 +301,25 @@ void MdnsPublisher::send_announcements(bool goodbye) {
     // Build _airplay._tcp record
     {
         std::map<std::string, std::string> txt;
+        // model 空时按能力选：支持视频就用 AppleTV-like，否则用 AudioAccessory1,2
+        std::string model = device_.model;
+        if (model.empty()) model = device_.supports_video ? "AppleTV6,2" : "AudioAccessory1,2";
+
         txt["deviceid"]  = device_.device_id;
         txt["features"]  = format_features(device_.features);
-        txt["model"]     = device_.model;
+        txt["model"]     = model;
         txt["srcvers"]   = "605.30.1";
-        txt["vv"]        = "2";    // AirPlay 2
+        txt["vv"]        = device_.supports_video ? "2" : "1"; // vv=2 显示支持视频
         txt["vn"]        = "65537";
         txt["os"]        = "13.4.1";
-        txt["pk"]        = ""; // no FairPlay public key
+        txt["pk"]        = ""; // no FairPlay public key (需要 MFi 证书时填)
         txt["pi"]        = device_.device_id;
+        if (device_.supports_video) {
+            txt["tvOSVersion"]     = "13.4.1";
+            txt["acl"]             = "0";
+            txt["atm"]             = "RXVhQ2FzdGU=";
+            txt["cvs"]             = "1";
+        }
         if (!device_.requires_encryption) txt["sf"] = "0x80000"; // no password required
         else                              txt["sf"] = "0x0";
 

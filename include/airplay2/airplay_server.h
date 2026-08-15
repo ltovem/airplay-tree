@@ -18,6 +18,7 @@
 #include "airplay_config.h"
 #include "airplay_session.h"
 #include "audio_renderer.h"
+#include "video_renderer.h"
 #include <functional>
 #include <memory>
 #include <vector>
@@ -85,15 +86,15 @@ class AirPlayServer {
 public:
     /*!
      * @brief 构造服务端对象（不启动任何网络端口或线程，仅初始化配置）
-     * @param config    服务端配置（device、audio、端口范围等），内部会拷贝
-     * @param callbacks 状态回调，可空；可后续通过 set_callbacks() 替换
-     * @param renderer  音频渲染回调；为空时解码后的 PCM 会塞在内部
-     *                  AudioBuffer 里，需要用户调用 session→stats() 等方式
-     *                  感知（一般建议必传，否则相当于"静音模式"）。
+     * @param config         服务端配置（device、audio、端口范围等），内部会拷贝
+     * @param callbacks      状态回调，可空；可后续通过 set_callbacks() 替换
+     * @param audio_renderer 音频渲染回调；为空时相当于"静音模式"
+     * @param video_renderer 视频渲染回调；为空时视频帧被丢弃（仍可投音）
      */
     explicit AirPlayServer(const ServerConfig& config,
                            ServerCallbacks callbacks = {},
-                           IAudioRenderer* renderer = nullptr);
+                           IAudioRenderer* audio_renderer = nullptr,
+                           IVideoRenderer* video_renderer = nullptr);
     ~AirPlayServer();
 
     AirPlayServer(const AirPlayServer&) = delete;
@@ -133,6 +134,9 @@ public:
     /// 运行中替换音频渲染器；传 nullptr 停止向外喂音频。
     /// 线程安全（内部有一次轻量锁），但最好在没有 PLAYING 会话时切换。
     void set_audio_renderer(IAudioRenderer* renderer);
+
+    /// 运行中替换视频渲染器；传 nullptr 停止向外喂视频帧。
+    void set_video_renderer(IVideoRenderer* renderer);
 
     /// 运行中替换回调；不替换的字段需自行保留旧值
     void set_callbacks(ServerCallbacks callbacks);
