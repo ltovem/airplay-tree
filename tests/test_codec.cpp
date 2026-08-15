@@ -129,7 +129,8 @@ TEST(AudioBuffer, TotalStats_Accumulate) {
     ab.write_bytes(b, 40);
     ab.write_bytes(b, 40);
     EXPECT_EQ(ab.total_written_frames(), uint64_t(20));
-    uint8_t out[40];
+    // 读 15 帧 = 60 字节，缓冲区需 >= 60
+    uint8_t out[64];
     ab.read_frames(out, 5);
     EXPECT_EQ(ab.total_read_frames(), uint64_t(5));
     ab.read_frames(out, 15);
