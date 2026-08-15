@@ -19,6 +19,7 @@
 #include <cmath>
 #include <sstream>
 #include <cctype>
+#include <algorithm>   // std::min（bplist varint 解析截断）
 
 namespace airplay2 {
 namespace util {

@@ -5,6 +5,7 @@
 #include "../platform/platform_log.h"
 #include "../platform/platform_time.h"
 #include <cstring>
+#include <utility>     // std::swap（声道交错转换）
 
 namespace airplay2 {
 
