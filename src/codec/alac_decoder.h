@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include <array>
 
 namespace airplay2 {
 namespace codec {
@@ -80,7 +81,7 @@ public:
     const AlacMagicCookie& cookie() const { return cookie_; }
 
 private:
-    // 位读取器（大端 MSB-first，与 FFmpeg get_bits 一致）
+    // Bit reader
     struct BitReader {
         const uint8_t* base = nullptr;
         size_t total = 0;
@@ -94,19 +95,22 @@ private:
         int      bits_left() const { return (int)(total * 8 - pos_bits); }
     };
 
-    /*!
-     * @brief Rice 残差解码（FFmpeg alac.c rice_decompress 移植）。
-     * 参数：k=rice_limit，mod_shift=bps，max_samples=rice_history_mult，
-     *      initial_history=rice_initial_history（cookie.kb）。
-     */
     static int rice_decompress(BitReader& br, int k, int32_t* samples, int count,
-                               int mod_shift, int max_samples, int initial_history);
-    /*! Rice 值解码（FFmpeg decode_scalar + get_unary_0_9） */
-    static uint32_t decode_scalar(BitReader& br, int k, int bps);
+                                int mod_shift, int max_samples);
+    void decode_channel(BitReader& br, int32_t* out, int samples,
+                        int predictor_num, int m, uint32_t* lpc_coefs,
+                        int chan_bits, int chan_history);
+    static int32_t idiv_shift(int32_t a, int shift);
 
     bool configured_ = false;
     AlacMagicCookie cookie_;
     AudioConfig out_cfg_;
+
+    // Predictor history (per channel)
+    static constexpr int kMaxChannels = 2;
+    static constexpr int kMaxPredictor = 32;
+    std::array<std::array<int32_t, kMaxPredictor>, kMaxChannels> predictor_buf_;
+    std::array<int, kMaxChannels> predictor_used_;
 };
 
 } // namespace codec

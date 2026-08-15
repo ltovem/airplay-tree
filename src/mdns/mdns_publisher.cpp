@@ -355,16 +355,17 @@ void MdnsPublisher::send_announcements(bool goodbye) {
         txt["vv"]        = device_.supports_video ? "2" : "1"; // vv=2 显示支持视频
         txt["vn"]        = "65537";
         txt["os"]        = "13.4.1";
-        txt["pk"]        = ""; // no FairPlay public key (需要 MFi 证书时填)
+        txt["pk"]        = device_.public_key_b64; // Ed25519 公钥(base64)，iOS 配对必需
         txt["pi"]        = device_.device_id;
+        // flags=状态位图(20bit)。0x84 对齐 UxPlay AIRPLAY_FLAGS，
+        // 让 iOS 正确归类设备能力（是否播放中/是否支持遥控等）。
+        txt["flags"]     = "0x84";
         if (device_.supports_video) {
             txt["tvOSVersion"]     = "13.4.1";
             txt["acl"]             = "0";
             txt["atm"]             = "RXVhQ2FzdGU=";
             txt["cvs"]             = "1";
         }
-        if (!device_.requires_encryption) txt["sf"] = "0x80000"; // no password required
-        else                              txt["sf"] = "0x0";
 
         auto pkt = build_service_record(device_.name, "_airplay._tcp", "local",
                                         device_.port, txt, kTtlDefault, goodbye, adv_ip_);
@@ -394,6 +395,9 @@ void MdnsPublisher::send_announcements(bool goodbye) {
         txt["sr"]        = "44100";
         txt["ss"]        = "16";
         txt["ch"]        = "2";
+        txt["txtvers"]   = "1";          // TXT record 版本（_raop 标准字段）
+        txt["sf"]        = "0x4";        // sender features（对齐 UxPlay RAOP_SF）
+        txt["sv"]        = "false";      // 是否"软件设备"（对齐 UxPlay RAOP_SV）
 
         auto pkt = build_service_record(devid + "@" + device_.name, "_raop._tcp", "local",
                                         device_.port, txt, kTtlDefault, goodbye, adv_ip_);
@@ -466,16 +470,15 @@ bool MdnsPublisher::register_with_bonjour() {
     txt["vv"]       = device_.supports_video ? "2" : "1";
     txt["vn"]       = "65537";
     txt["os"]       = "13.4.1";
-    txt["pk"]       = "";
+    txt["pk"]       = device_.public_key_b64; // Ed25519 公钥(base64)，iOS 配对必需
     txt["pi"]       = device_.device_id;
+    txt["flags"]    = "0x84"; // 对齐 UxPlay AIRPLAY_FLAGS，见 send_announcements() 注释
     if (device_.supports_video) {
         txt["tvOSVersion"] = "13.4.1";
         txt["acl"]         = "0";
         txt["atm"]         = "RXVhQ2FzdGU=";
         txt["cvs"]         = "1";
     }
-    if (!device_.requires_encryption) txt["sf"] = "0x80000"; // no password required
-    else                              txt["sf"] = "0x0";
     auto blob = build_txt_blob(txt);
 
     // host=NULL：让 mDNSResponder 用本机主机名作为 SRV target，A 记录自动解析
@@ -512,6 +515,9 @@ bool MdnsPublisher::register_with_bonjour() {
     rtxt["sr"] = "44100";
     rtxt["ss"] = "16";
     rtxt["ch"] = "2";
+    rtxt["txtvers"] = "1";  // _raop 标准字段，与 UDP 路径保持一致
+    rtxt["sf"] = "0x4";     // sender features（对齐 UxPlay RAOP_SF）
+    rtxt["sv"] = "false";   // 对齐 UxPlay RAOP_SV
     auto rblob = build_txt_blob(rtxt);
     err = DNSServiceRegister(
         &raop_ref_, 0, 0, (devid + "@" + device_.name).c_str(),

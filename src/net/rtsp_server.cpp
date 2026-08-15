@@ -250,8 +250,10 @@ static std::string xml_escape(const std::string& s) {
 }
 
 std::string RtspServer::build_info_plist(const DeviceInfo& dev) {
-    char features[32];
-    std::snprintf(features, sizeof(features), "0x%08X", dev.features);
+    // /info 响应键名与类型对齐 openairplay/airplay-spec GET /info 规范：
+    //   features/vv/statusFlags 必须是 <integer>（十进制），不能是字符串；
+    //   键名用 deviceID / macAddress 等驼峰写法（旧实现 deviceid= 字符串，
+    //   features=字符串 已被 iOS 容忍但非规范，此处一并修正）。
     std::ostringstream oss;
     oss << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
     oss << "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n";
@@ -259,21 +261,29 @@ std::string RtspServer::build_info_plist(const DeviceInfo& dev) {
     auto kv = [&](const char* k, const std::string& v) {
         oss << "<key>" << k << "</key><string>" << xml_escape(v) << "</string>\n";
     };
-    auto kvi = [&](const char* k, int v) {
+    auto kvi = [&](const char* k, int64_t v) {
         oss << "<key>" << k << "</key><integer>" << v << "</integer>\n";
     };
-    kv("deviceid", dev.device_id);
+    kv("deviceID", dev.device_id);
+    kv("macAddress", dev.device_id);
     kv("name", dev.name);
     kv("model", dev.model);
-    kv("features", features);
+    kvi("features", dev.features);  // integer 十进制（spec 要求，不能是 "0x.." 字符串）
     kv("manufacturer", dev.manufacturer);
     if (!dev.serial_number.empty()) kv("serialNumber", dev.serial_number);
-    kv("protovers", "1.1");
+    kv("protocolVersion", "1.1");
     kv("srcvers", "605.30.1");
-    kv("vv", "2"); // AirPlay 2
-    kv("os", "13.4.1");
+    kv("pi", dev.device_id);
+    kvi("vv", 2);                 // AirPlay 2
+    kvi("statusFlags", 68);       // 0x44，对齐 UxPlay（表示支持音量控制等）
     kvi("pw", dev.requires_encryption ? 1 : 0);
-    kvi("pk", 0);
+    // XML plist 的 <data> 元素内容就是 base64；iOS 通过它拿到本机 Ed25519 公钥
+    // 进行 legacy 配对。为空时（未配置身份）退化为 0 占位。
+    if (!dev.public_key_b64.empty()) {
+        oss << "<key>pk</key><data>" << dev.public_key_b64 << "</data>\n";
+    } else {
+        kvi("pk", 0);
+    }
     kvi("acl", 0);
     oss << "</dict></plist>\n";
     return oss.str();
@@ -297,6 +307,57 @@ void RtspServer::stop() {
     http_.stop();
 }
 
+/* ================================================================
+ *  FairPlay SAP（/fp-setup 用）—— 音频流媒体加密协商
+ *
+ *  setup 消息 1（seq=1，16 字节请求）：req[4]=版本(3) req[6]=seq(1)
+ *      req[14]=mode(0..3) → 回 142 字节 FPLY server hello（固定应答，
+ *      UxPlay/shairport-sync 同款硬编码；公开协议数据，非设备私密）
+ *  setup 消息 2（seq=3，164 字节请求）：
+ *      → 回 12 字节 FPLY 头 + 请求末尾 20 字节 = 32 字节
+ * ================================================================ */
+
+// FPLY server hello 回复（mode 0..3），与 UxPlay / shairport-sync 完全一致
+static const uint8_t kFplyReply[4][142] = {
+    {0x46,0x50,0x4c,0x59,0x03,0x01,0x02,0x00,0x00,0x00,0x00,0x82,0x02,0x00,0x0f,0x9f,0x3f,0x9e,0x0a,0x25,0x21,0xdb,0xdf,0x31,0x2a,0xb2,0xbf,0xb2,0x9e,0x8d,0x23,0x2b,0x63,0x76,0xa8,0xc8,0x18,0x70,0x1d,0x22,0xae,0x93,0xd8,0x27,0x37,0xfe,0xaf,0x9d,0xb4,0xfd,0xf4,0x1c,0x2d,0xba,0x9d,0x1f,0x49,0xca,0xaa,0xbf,0x65,0x91,0xac,0x1f,0x7b,0xc6,0xf7,0xe0,0x66,0x3d,0x21,0xaf,0xe0,0x15,0x65,0x95,0x3e,0xab,0x81,0xf4,0x18,0xce,0xed,0x09,0x5a,0xdb,0x7c,0x3d,0x0e,0x25,0x49,0x09,0xa7,0x98,0x31,0xd4,0x9c,0x39,0x82,0x97,0x34,0x34,0xfa,0xcb,0x42,0xc6,0x3a,0x1c,0xd9,0x11,0xa6,0xfe,0x94,0x1a,0x8a,0x6d,0x4a,0x74,0x3b,0x46,0xc3,0xa7,0x64,0x9e,0x44,0xc7,0x89,0x55,0xe4,0x9d,0x81,0x55,0x00,0x95,0x49,0xc4,0xe2,0xf7,0xa3,0xf6,0xd5,0xba},
+    {0x46,0x50,0x4c,0x59,0x03,0x01,0x02,0x00,0x00,0x00,0x00,0x82,0x02,0x01,0xcf,0x32,0xa2,0x57,0x14,0xb2,0x52,0x4f,0x8a,0xa0,0xad,0x7a,0xf1,0x64,0xe3,0x7b,0xcf,0x44,0x24,0xe2,0x00,0x04,0x7e,0xfc,0x0a,0xd6,0x7a,0xfc,0xd9,0x5d,0xed,0x1c,0x27,0x30,0xbb,0x59,0x1b,0x96,0x2e,0xd6,0x3a,0x9c,0x4d,0xed,0x88,0xba,0x8f,0xc7,0x8d,0xe6,0x4d,0x91,0xcc,0xfd,0x5c,0x7b,0x56,0xda,0x88,0xe3,0x1f,0x5c,0xce,0xaf,0xc7,0x43,0x19,0x95,0xa0,0x16,0x65,0xa5,0x4e,0x19,0x39,0xd2,0x5b,0x94,0xdb,0x64,0xb9,0xe4,0x5d,0x8d,0x06,0x3e,0x1e,0x6a,0xf0,0x7e,0x96,0x56,0x16,0x2b,0x0e,0xfa,0x40,0x42,0x75,0xea,0x5a,0x44,0xd9,0x59,0x1c,0x72,0x56,0xb9,0xfb,0xe6,0x51,0x38,0x98,0xb8,0x02,0x27,0x72,0x19,0x88,0x57,0x16,0x50,0x94,0x2a,0xd9,0x46,0x68,0x8a},
+    {0x46,0x50,0x4c,0x59,0x03,0x01,0x02,0x00,0x00,0x00,0x00,0x82,0x02,0x02,0xc1,0x69,0xa3,0x52,0xee,0xed,0x35,0xb1,0x8c,0xdd,0x9c,0x58,0xd6,0x4f,0x16,0xc1,0x51,0x9a,0x89,0xeb,0x53,0x17,0xbd,0x0d,0x43,0x36,0xcd,0x68,0xf6,0x38,0xff,0x9d,0x01,0x6a,0x5b,0x52,0xb7,0xfa,0x92,0x16,0xb2,0xb6,0x54,0x82,0xc7,0x84,0x44,0x11,0x81,0x21,0xa2,0xc7,0xfe,0xd8,0x3d,0xb7,0x11,0x9e,0x91,0x82,0xaa,0xd7,0xd1,0x8c,0x70,0x63,0xe2,0xa4,0x57,0x55,0x59,0x10,0xaf,0x9e,0x0e,0xfc,0x76,0x34,0x7d,0x16,0x40,0x43,0x80,0x7f,0x58,0x1e,0xe4,0xfb,0xe4,0x2c,0xa9,0xde,0xdc,0x1b,0x5e,0xb2,0xa3,0xaa,0x3d,0x2e,0xcd,0x59,0xe7,0xee,0xe7,0x0b,0x36,0x29,0xf2,0x2a,0xfd,0x16,0x1d,0x87,0x73,0x53,0xdd,0xb9,0x9a,0xdc,0x8e,0x07,0x00,0x6e,0x56,0xf8,0x50,0xce},
+    {0x46,0x50,0x4c,0x59,0x03,0x01,0x02,0x00,0x00,0x00,0x00,0x82,0x02,0x03,0x90,0x01,0xe1,0x72,0x7e,0x0f,0x57,0xf9,0xf5,0x88,0x0d,0xb1,0x04,0xa6,0x25,0x7a,0x23,0xf5,0xcf,0xff,0x1a,0xbb,0xe1,0xe9,0x30,0x45,0x25,0x1a,0xfb,0x97,0xeb,0x9f,0xc0,0x01,0x1e,0xbe,0x0f,0x3a,0x81,0xdf,0x5b,0x69,0x1d,0x76,0xac,0xb2,0xf7,0xa5,0xc7,0x08,0xe3,0xd3,0x28,0xf5,0x6b,0xb3,0x9d,0xbd,0xe5,0xf2,0x9c,0x8a,0x17,0xf4,0x81,0x48,0x7e,0x3a,0xe8,0x63,0xc6,0x78,0x32,0x54,0x22,0xe6,0xf7,0x8e,0x16,0x6d,0x18,0xaa,0x7f,0xd6,0x36,0x25,0x8b,0xce,0x28,0x72,0x6f,0x66,0x1f,0x73,0x88,0x93,0xce,0x44,0x31,0x1e,0x4b,0xe6,0xc0,0x53,0x51,0x93,0xe5,0xef,0x72,0xe8,0x68,0x62,0x33,0x72,0x9c,0x22,0x7d,0x82,0x0c,0x99,0x94,0x45,0xd8,0x92,0x46,0xc8,0xc3,0x59}
+};
+
+// FPLY setup 消息 2 的回复头（12 字节）
+static const uint8_t kFplyHeader[12] = {0x46,0x50,0x4c,0x59,0x03,0x01,0x04,0x00,0x00,0x00,0x00,0x14};
+
+/*!
+ * @brief 处理 FairPlay SAP setup 请求（/fp-setup 用）
+ *
+ * @param body 请求体
+ * @param len  请求长度
+ * @return 响应体；空表示无法识别（调用方回空 200）
+ */
+std::vector<uint8_t> handle_fairplay_setup(const uint8_t* body, size_t len) {
+    std::vector<uint8_t> out;
+    if (!body || len < 12) return out;
+    // 协议字段：req[4]=版本(须为 3)，req[6]=seq（1=setup1，3=setup2），
+    //           req[14]=mode（0..3，仅 setup1 用）
+    AP2_LOGI("rtsp: fairplay setup len=%zu ver=%u seq=%u mode=%u",
+             len, body[4], body[6], len > 14 ? body[14] : 0);
+    if (body[4] != 3) return out;  // 不支持的 FairPlay 版本
+    if (body[6] == 1) {
+        // setup 消息 1：回 142 字节 FPLY server hello（按 mode 选）
+        uint8_t mode = len > 14 ? body[14] : 0;
+        if (mode > 3) return out;
+        out.assign(kFplyReply[mode], kFplyReply[mode] + 142);
+    } else if (body[6] == 3) {
+        // setup 消息 2：回 12 字节头 + 请求末尾 20 字节
+        const size_t kSuffix = 20;
+        if (len < kSuffix) return out;
+        out.assign(kFplyHeader, kFplyHeader + 12);
+        out.insert(out.end(), body + len - kSuffix, body + len);
+    }
+    return out;
+}
+
 void RtspServer::install_routes(const DeviceInfo& dev) {
     // /info - GET
     http_.add_route("GET", "/info", [this, dev](const HttpRequest& req, Connection& c) -> HttpResponse {
@@ -313,14 +374,39 @@ void RtspServer::install_routes(const DeviceInfo& dev) {
     // /pair-setup, /pair-verify (POST)
     http_.add_route("POST", "/pair-setup", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
         std::vector<uint8_t> resp_body;
-        if (handlers_.on_pair_setup) resp_body = handlers_.on_pair_setup(c.id(), req.body.data(), req.body.size());
+        if (handlers_.on_pair_setup)
+            resp_body = handlers_.on_pair_setup(c.id(), c.peer_ip(), req.body.data(), req.body.size());
         HeaderMap extra;
         extra["Content-Type"] = "application/octet-stream";
         return make_rtsp_ok(req.cseq(), extra, std::move(resp_body));
     }, true);
     http_.add_route("POST", "/pair-verify", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
         std::vector<uint8_t> resp_body;
-        if (handlers_.on_pair_verify) resp_body = handlers_.on_pair_verify(c.id(), req.body.data(), req.body.size());
+        if (handlers_.on_pair_verify)
+            resp_body = handlers_.on_pair_verify(c.id(), c.peer_ip(), req.body.data(), req.body.size());
+        HeaderMap extra;
+        extra["Content-Type"] = "application/octet-stream";
+        return make_rtsp_ok(req.cseq(), extra, std::move(resp_body));
+    }, true);
+
+    // /auth-setup（MFi 握手）。正常情况下 iOS 只在 features bit26
+    // (HasUnifiedAdvertiserInfo) 置位时才发起；我们 bit26=0，iOS 不会走到这里。
+    // 万一有客户端仍发起：对齐 UxPlay 行为——未注册路由回空 200，
+    // 而不是回"空证书+空签名"的 40B（后者已被实测导致 iOS 断开）。
+    http_.add_route("POST", "/auth-setup", [this](const HttpRequest& req, Connection&) -> HttpResponse {
+        (void)this;
+        HeaderMap extra;
+        extra["Content-Type"] = "application/octet-stream";
+        return make_rtsp_ok(req.cseq(), extra);
+    }, true);
+
+    // /fp-setup（音频）—— FairPlay SAP 媒体加密握手
+    http_.add_route("POST", "/fp-setup", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        std::vector<uint8_t> resp_body;
+        if (handlers_.on_fairplay_setup)
+            resp_body = handlers_.on_fairplay_setup(c.id(), req.body.data(), req.body.size());
+        else
+            resp_body = handle_fairplay_setup(req.body.data(), req.body.size());
         HeaderMap extra;
         extra["Content-Type"] = "application/octet-stream";
         return make_rtsp_ok(req.cseq(), extra, std::move(resp_body));
@@ -357,6 +443,79 @@ void RtspServer::install_routes(const DeviceInfo& dev) {
 
     // SETUP
     http_.add_route("SETUP", "", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        // AirPlay 2 的 SETUP 请求体是 binary plist（ekey/eiv/streams/timingPort），
+        // 响应也必须是 binary plist。legacy AP1 用 Transport: 头。
+        // 判断依据：body 以 "bplist00" 开头（Apple 官方 plist 魔数）。
+        bool is_ap2 = (req.body.size() >= 8 &&
+                       memcmp(req.body.data(), "bplist00", 8) == 0);
+        if (is_ap2) {
+            util::PlistValue root;
+            if (!util::parse_binary_plist(req.body.data(), req.body.size(), root) ||
+                !root.is_dict()) {
+                AP2_LOGW("rtsp: SETUP(AP2) body not a bplist dict, len=%zu", req.body.size());
+                return make_rtsp_ok(req.cseq(), {}, {}, "application/x-apple-binary-plist");
+            }
+            // 解析请求字段
+            Ap2SetupRequest ap2req;
+            const auto& ek = root.get("ekey");
+            if (ek.is_data()) ap2req.ekey = ek.as_data();
+            const auto& eiv = root.get("eiv");
+            if (eiv.is_data()) ap2req.eiv = eiv.as_data();
+            ap2req.timing_port = (uint64_t)root.get_int("timingPort");
+            ap2req.timing_protocol = root.get_string("timingProtocol");
+            ap2req.is_remote_control_only = root.get_bool("isRemoteControlOnly");
+            const util::PlistValue& streams = root.get("streams");
+            if (streams.is_array()) {
+                for (const auto& s : streams.array()) {
+                    if (!s.is_dict()) continue;
+                    Ap2StreamReq sr;
+                    sr.type = (uint64_t)s.get_int("type");
+                    sr.control_port = (uint64_t)s.get_int("controlPort");
+                    sr.stream_connection_id = (uint64_t)s.get_int("streamConnectionID");
+                    sr.ct = (uint64_t)s.get_int("ct");
+                    sr.spf = (uint64_t)s.get_int("spf");
+                    ap2req.streams.push_back(sr);
+                }
+            }
+            AP2_LOGI("rtsp: SETUP(AP2) streams=%zu timingPort=%llu proto=%s ekey=%zuB eiv=%zuB",
+                     ap2req.streams.size(), (unsigned long long)ap2req.timing_port,
+                     ap2req.timing_protocol.c_str(), ap2req.ekey.size(), ap2req.eiv.size());
+            for (auto& s : ap2req.streams)
+                AP2_LOGI("rtsp:   stream type=%llu controlPort=%llu streamConnectionID=%llu ct=%llu spf=%llu",
+                         (unsigned long long)s.type, (unsigned long long)s.control_port,
+                         (unsigned long long)s.stream_connection_id,
+                         (unsigned long long)s.ct, (unsigned long long)s.spf);
+
+            Ap2SetupResponse resp;
+            if (handlers_.on_setup_ap2) resp = handlers_.on_setup_ap2(c.id(), ap2req);
+
+            // 构建 binary plist 响应
+            auto out = util::PlistValue::make_dict();
+            if (!resp.ok) {
+                return make_rtsp_ok(req.cseq(), {}, {}, "application/x-apple-binary-plist");
+            }
+            out.dict()["timingPort"] = util::PlistValue::make_int(resp.timing_port);
+            out.dict()["eventPort"]  = util::PlistValue::make_int(resp.event_port);
+            auto streams_out = util::PlistValue::make_array();
+            for (auto& s : resp.streams) {
+                auto sd = util::PlistValue::make_dict();
+                sd.dict()["dataPort"] = util::PlistValue::make_int(s.data_port);
+                if (s.type == 96 && s.control_port > 0)
+                    sd.dict()["controlPort"] = util::PlistValue::make_int(s.control_port);
+                sd.dict()["type"] = util::PlistValue::make_int((int64_t)s.type);
+                streams_out.array().push_back(std::move(sd));
+            }
+            out.dict()["streams"] = std::move(streams_out);
+
+            std::vector<uint8_t> body;
+            util::serialize_binary_plist(out, body);
+            HeaderMap extra;
+            extra["Session"] = "airplay2lib-" + std::to_string(c.id());
+            return make_rtsp_ok(req.cseq(), extra, std::move(body),
+                                "application/x-apple-binary-plist");
+        }
+
+        // ---- legacy AP1 SETUP（Transport: header）----
         // Client tells us remote ports via Transport: header
         // Transport: RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;client_port=6002-6003
         int remote_ports[3] = {0,0,0};
@@ -621,13 +780,12 @@ void RtspServer::install_routes(const DeviceInfo& dev) {
         return make_rtsp_ok(req.cseq());
     }, false);
 
-    // Default handler
+    // Default handler：UxPlay 对未注册路径也回 200 空 body，iOS 才继续走
+    // ANNOUNCE/SETUP；回 404 会让 iOS 直接断开连接。
     http_.set_default_handler([this](const HttpRequest& req, Connection& c) -> HttpResponse {
         if (handlers_.on_unknown) return handlers_.on_unknown(req, c);
-        HttpResponse r; r.code = 404; r.reason = "Not Found";
-        r.headers["CSeq"] = std::to_string(req.cseq());
-        r.headers["Server"] = "airplay2lib/1.0";
-        return r;
+        AP2_LOGI("rtsp: unhandled %s %s -> 200 empty", req.method.c_str(), req.uri.c_str());
+        return make_rtsp_ok(req.cseq());
     });
 }
 

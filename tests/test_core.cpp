@@ -6,9 +6,12 @@
 #include "core/airplay_pairing.h"
 #include "core/fairplay.h"
 #include "crypto/curve25519.h"
+#include "crypto/sha512.h"
+#include "crypto/aes_ctr.h"
 
 #include <cstdint>
 #include <cstring>
+#include <cstdio>    // std::remove（删除临时身份种子文件）
 #include <string>
 #include <vector>
 
@@ -72,9 +75,152 @@ TEST(Pairing, PinCallback_WhenSet) {
     // handle_pair_setup 会触发 callback
     std::vector<uint8_t> body = {0xAA,0xBB};
     bool need_pin = false;
-    auto resp = p.handle_pair_setup("1.1.1.1", body.data(), body.size(), need_pin);
+    auto resp = p.handle_pair_setup(1, "1.1.1.1", body.data(), body.size(), need_pin);
     // 是否触发 callback 取决于内部实现；只要不崩溃即可
     EXPECT_TRUE(resp.size() > 0 || resp.size() == 0);
+}
+
+/* ====================================================================
+ *              AirPlayPairing —— legacy Ed25519 配对
+ * ==================================================================== */
+
+TEST(Pairing, LegacyPairSetup_Returns32BPublicKey) {
+    AirPlayPairing p;
+    p.load_or_create_identity("");  // 内存临时身份
+    EXPECT_TRUE(p.identity_ready());
+    EXPECT_EQ(p.public_key().size(), size_t(32));
+    EXPECT_FALSE(p.public_key_b64().empty());
+
+    // 客户端发 32 字节 Ed25519 公钥（M1），服务端应回自己 32 字节公钥（M2）
+    std::vector<uint8_t> client_pk(32, 0x42);
+    bool need_pin = false;
+    auto resp = p.handle_pair_setup(11, "192.168.1.77", client_pk.data(), client_pk.size(), need_pin);
+    EXPECT_EQ(resp.size(), size_t(32));
+    EXPECT_EQ(resp, p.public_key());
+    EXPECT_FALSE(need_pin);
+    EXPECT_TRUE(p.is_paired("192.168.1.77"));
+}
+
+TEST(Pairing, LegacyPairSetup_ShortBody_Unhandled) {
+    AirPlayPairing p;
+    p.load_or_create_identity("");
+    std::vector<uint8_t> short_body = {0x01};
+    bool need_pin = false;
+    auto resp = p.handle_pair_setup(12, "10.0.0.9", short_body.data(), short_body.size(), need_pin);
+    EXPECT_TRUE(resp.empty());  // 未处理 → 空，上层走其它路径
+}
+
+TEST(Pairing, NoPin_PairVerify_OkEmpty) {
+    AirPlayPairing p;
+    p.load_or_create_identity("");
+    bool pin_ok = false;
+    std::vector<uint8_t> body(100, 0x00);
+    auto resp = p.handle_pair_verify(13, "10.0.0.9", body.data(), body.size(), pin_ok);
+    EXPECT_TRUE(pin_ok);
+    EXPECT_TRUE(resp.empty());  // UxPlay 同款：空 200 即通过
+}
+
+// pair-verify 完整握手回环：模拟 iOS 客户端与服务端做 ECDH+Ed25519+AES-CTR 两轮交换
+TEST(Pairing, PairVerify_HandshakeRoundtrip) {
+    AirPlayPairing server;
+    server.load_or_create_identity("");
+    auto server_ed_pk = server.public_key();  // 服务端长期 Ed25519 公钥
+
+    // 客户端（模拟 iOS）：自己的 Ed25519 身份 + 临时 X25519
+    std::vector<uint8_t> client_seed(32, 0x11);
+    auto client_ed = crypto::ed25519_generate(client_seed);
+    std::vector<uint8_t> ecdh_seed(32, 0x22);
+    uint8_t client_ecdh_sk[32], client_ecdh_pk[32];
+    crypto::x25519_keygen(ecdh_seed.data(), client_ecdh_sk, client_ecdh_pk);
+
+    // --- M1: client → server ---
+    std::vector<uint8_t> m1 = {1, 0, 0, 0};
+    m1.insert(m1.end(), client_ecdh_pk, client_ecdh_pk + 32);
+    m1.insert(m1.end(), client_ed.pk.begin(), client_ed.pk.end());
+    const uint64_t kConn = 42;
+    bool ok = false;
+    auto m2 = server.handle_pair_verify(kConn, "9.9.9.9", m1.data(), m1.size(), ok);
+    EXPECT_EQ(m2.size(), size_t(96));  // server_ecdh_pk(32) + 加密签名(64)
+    if (m2.size() != 96) return;
+
+    // --- 客户端处理 M2：派生密钥、解密并验证服务端签名 ---
+    uint8_t shared[32];
+    EXPECT_TRUE(crypto::x25519_shared(client_ecdh_sk, m2.data(), shared));
+    auto derive = [&](const char* salt) {
+        std::vector<uint8_t> buf;
+        std::string s(salt);
+        buf.insert(buf.end(), s.begin(), s.end());
+        buf.insert(buf.end(), shared, shared + 32);
+        uint8_t h[64];
+        crypto::Sha512::hash(buf.data(), buf.size(), h);
+        return std::vector<uint8_t>(h, h + 16);
+    };
+    auto key = derive("Pair-Verify-AES-Key");
+    auto iv  = derive("Pair-Verify-AES-IV");
+    crypto::AesCtr ctr;
+    ctr.set_key(key.data(), iv.data());
+    std::vector<uint8_t> server_sig(64);
+    ctr.process(m2.data() + 32, server_sig.data(), 64);  // 解密(keystream 0..63)
+    // 服务端签名内容：server_ecdh_pk || client_ecdh_pk
+    std::vector<uint8_t> msg1;
+    msg1.insert(msg1.end(), m2.begin(), m2.begin() + 32);
+    msg1.insert(msg1.end(), client_ecdh_pk, client_ecdh_pk + 32);
+    EXPECT_TRUE(crypto::ed25519_verify(server_ed_pk, msg1.data(), msg1.size(), server_sig.data()));
+
+    // --- M2: client → server（签名继续用同一 keystream 64..127） ---
+    std::vector<uint8_t> msg2;
+    msg2.insert(msg2.end(), client_ecdh_pk, client_ecdh_pk + 32);
+    msg2.insert(msg2.end(), m2.begin(), m2.begin() + 32);  // client_ecdh || server_ecdh
+    auto client_sig = crypto::ed25519_sign(client_ed, msg2.data(), msg2.size());
+    ctr.process(client_sig.data(), client_sig.data(), 64);  // 加密(keystream 64..127)
+    std::vector<uint8_t> m2b = {0, 0, 0, 0};
+    m2b.insert(m2b.end(), client_sig.begin(), client_sig.end());
+
+    ok = false;
+    auto resp = server.handle_pair_verify(kConn, "9.9.9.9", m2b.data(), m2b.size(), ok);
+    EXPECT_TRUE(ok);
+    EXPECT_TRUE(resp.empty());  // 验签通过 → 空 200
+    EXPECT_TRUE(server.is_paired("9.9.9.9"));
+}
+
+// 验签失败必须拒绝（错误签名 → 非空失败响应，不标记配对）
+TEST(Pairing, PairVerify_BadSignature_Rejected) {
+    AirPlayPairing server;
+    server.load_or_create_identity("");
+    bool ok = false;
+    // M1 用合法密钥，M2 伪造签名
+    std::vector<uint8_t> client_seed(32, 0x33);
+    auto client_ed = crypto::ed25519_generate(client_seed);
+    std::vector<uint8_t> ecdh_seed(32, 0x44);
+    uint8_t ecdh_sk[32], ecdh_pk[32];
+    crypto::x25519_keygen(ecdh_seed.data(), ecdh_sk, ecdh_pk);
+    std::vector<uint8_t> m1 = {1, 0, 0, 0};
+    m1.insert(m1.end(), ecdh_pk, ecdh_pk + 32);
+    m1.insert(m1.end(), client_ed.pk.begin(), client_ed.pk.end());
+    const uint64_t kConn = 43;
+    auto m2 = server.handle_pair_verify(kConn, "8.8.8.8", m1.data(), m1.size(), ok);
+    EXPECT_EQ(m2.size(), size_t(96));
+    std::vector<uint8_t> m2b = {0, 0, 0, 0};
+    m2b.insert(m2b.end(), 64, 0xAB);  // 乱签
+    ok = false;
+    auto resp = server.handle_pair_verify(kConn, "8.8.8.8", m2b.data(), m2b.size(), ok);
+    EXPECT_FALSE(ok);
+    EXPECT_FALSE(resp.empty());  // 失败响应
+    EXPECT_FALSE(server.is_paired("8.8.8.8"));
+}
+
+TEST(Pairing, Identity_PersistsAcrossReload) {
+    AirPlayPairing a;
+    const std::string key_path = "test_pairing_identity.key";
+    a.load_or_create_identity(key_path);
+    auto pk_a = a.public_key_b64();
+    EXPECT_FALSE(pk_a.empty());
+
+    // 用同一种子文件重建对象，公钥必须一致
+    AirPlayPairing b;
+    b.load_or_create_identity(key_path);
+    EXPECT_EQ(b.public_key_b64(), pk_a);
+    std::remove(key_path.c_str());
 }
 
 /* ====================================================================

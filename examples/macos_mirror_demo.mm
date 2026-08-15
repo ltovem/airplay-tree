@@ -825,14 +825,19 @@ static std::atomic<bool> g_running{true};
     std::string device_name_;
     uint16_t port_;
     std::string pin_;
+    std::string model_;
+    std::string keyfile_;
 }
 
-- (instancetype)initWithName:(std::string)name port:(uint16_t)port pin:(std::string)pin {
+- (instancetype)initWithName:(std::string)name port:(uint16_t)port pin:(std::string)pin
+                       model:(std::string)model keyfile:(std::string)keyfile {
     self = [super init];
     if (self) {
         device_name_ = std::move(name);
         port_ = port;
         pin_ = std::move(pin);
+        model_ = std::move(model);
+        keyfile_ = std::move(keyfile);
     }
     return self;
 }
@@ -1013,6 +1018,8 @@ static std::atomic<bool> g_running{true};
                   (unsigned long long)g_video->frames_total(),
                   g_audio->get_volume());
     self.statsLabel.stringValue = [NSString stringWithUTF8String:buf];
+    // 本地调试：统计行也回显到终端
+    fprintf(stderr, "stats: %s\n", buf);
 }
 
 - (void)server_thread {
@@ -1026,11 +1033,16 @@ static std::atomic<bool> g_running{true};
     cfg.device.name = device_name_;
     cfg.device.port = port_;
     cfg.control_port = port_;
-    cfg.device.model = "MacBookPro18,3";
+    cfg.device.model = model_;  // mDNS TXT model：决定 iPhone 控制中心显示的图标
+    // 常见取值：MacBookPro18,3=电脑 / AppleTV6,2|AppleTV11,1=AppleTV
+    //           / AudioAccessory1,2|AudioAccessory5,1=音响(HomePod)
     cfg.device.supports_audio = true;
     cfg.device.supports_video = true;
     cfg.device.supports_photo = true;
-    cfg.device.features = 0x5F7FFFF7; // 音频 + 视频 (bit24) + H.264 (bit27)
+    // 对齐 UxPlay FEATURES_1=0x5A7FFEE6（实测 iOS 可投屏）。
+    // 注意 bit26(HasUnifiedAdvertiserInfo) 必须为 0：置 1 会让 iOS 强制走
+    // /auth-setup MFi 握手，没有 MFi 证书时 iOS 直接断开（曾导致"投不上"）。
+    cfg.device.features = 0x5A7FFEE6;
     {
         std::hash<std::string> h;
         size_t hv = h(device_name_);
@@ -1050,7 +1062,17 @@ static std::atomic<bool> g_running{true};
     cfg.max_sessions = 8;
     cfg.buffer_ms = 2000;
     cfg.enable_logging = true;
-    cfg.log_level = 2;
+    cfg.log_level = 4;  // 4=trace：本地调试时把每个 RTSP 请求/响应都打进日志面板
+    // 持久化 Ed25519 身份：重启后公钥不变，iOS 不会反复要求重新配对
+    if (!keyfile_.empty()) {
+        cfg.identity_key_path = keyfile_;
+    } else {
+        const char* home = getenv("HOME");
+        if (home) {
+            cfg.identity_key_path =
+                std::string(home) + "/Library/Application Support/airplay2lib/identity.key";
+        }
+    }
 
     // 音频输出格式（解码后的 PCM 直接按此播放）
     cfg.audio.sample_rate = 48000;
@@ -1079,9 +1101,10 @@ static std::atomic<bool> g_running{true};
         [strongSelf setStatus:[NSString stringWithUTF8String:text.c_str()]];
     };
     cbs.on_log = [strongSelf](int lvl, const std::string& m) {
-        // 错误/警告/信息都显示到 UI 日志面板（0=E, 1=W, 2=I），调试更直观
+        // 错误/警告/信息都显示到 UI 日志面板（0=E, 1=W, 2=I），调试更直观；
+        // 同时全部回显到终端，便于不打开 UI 时本地排查（如自动化测试）
+        fprintf(stderr, "[%c] %s\n", lvl == 0 ? 'E' : (lvl == 1 ? 'W' : 'I'), m.c_str());
         if (lvl <= 2) {
-            if (lvl <= 1) fprintf(stderr, "%s\n", m.c_str());
             [strongSelf appendLog:[NSString stringWithUTF8String:m.c_str()]];
         }
     };
@@ -1109,10 +1132,13 @@ static std::atomic<bool> g_running{true};
         auto st = s->stats();
         char buf[256];
         std::snprintf(buf, sizeof(buf),
-                      "投屏中  client=%s  audio=%llu B  latency=%u ms  jitter=%u ms",
+                      "投屏中  client=%s  audio=%llu B  pkts=%llu lost=%llu latency=%u ms jitter=%u ms",
                       st.client_ip.c_str(),
                       (unsigned long long)st.bytes_received,
+                      (unsigned long long)st.packets_received,
+                      (unsigned long long)st.packets_lost,
                       st.current_latency_ms, st.jitter_ms);
+        fprintf(stderr, "sess: %s\n", buf);  // 本地调试：会话统计
         [strongSelf setStatus:[NSString stringWithUTF8String:buf]];
     }
 
@@ -1129,16 +1155,26 @@ static std::atomic<bool> g_running{true};
 static void print_help(const char* argv0) {
     printf("Usage: %s [options]\n", argv0);
     printf("Options:\n");
-    printf("  -n, --name <name>   Device display name (default: \"My Mac\")\n");
-    printf("  -p, --port <port>   Control port (default: 7000)\n");
-    printf("  -k, --pin <xxxx>    4-digit PIN required to pair (optional)\n");
-    printf("  -h, --help          Show help\n");
+    printf("  -n, --name <name>    Device display name (default: \"My Mac\")\n");
+    printf("  -p, --port <port>    Control port (default: 7000)\n");
+    printf("  -k, --pin <xxxx>     4-digit PIN required to pair (optional)\n");
+    printf("  -K, --keyfile <path> Ed25519 identity seed file (default:\n");
+    printf("                         ~/Library/Application Support/airplay2lib/identity.key)\n");
+    printf("  -m, --model <model>  mDNS TXT model (controls Control-Center icon):\n");
+    printf("                         MacBookPro18,3    = computer\n");
+    printf("                         AppleTV6,2        = Apple TV\n");
+    printf("                         AppleTV11,1       = Apple TV 4K\n");
+    printf("                         AudioAccessory1,2 = speaker (HomePod)\n");
+    printf("                         AudioAccessory5,1 = speaker (HomePod mini)\n");
+    printf("  -h, --help           Show help\n");
 }
 
 int main(int argc, const char** argv) {
     std::string name = "My Mac";
     uint16_t port = 7000;
     std::string pin;
+    std::string keyfile;
+    std::string model = "MacBookPro18,3";  // 默认：电脑图标
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1148,12 +1184,15 @@ int main(int argc, const char** argv) {
         if (arg == "-n" || arg == "--name") name = next();
         else if (arg == "-p" || arg == "--port") port = (uint16_t)atoi(next().c_str());
         else if (arg == "-k" || arg == "--pin") pin = next();
+        else if (arg == "-K" || arg == "--keyfile") keyfile = next();
+        else if (arg == "-m" || arg == "--model") model = next();
         else if (arg == "-h" || arg == "--help") { print_help(argv[0]); return 0; }
     }
 
     @autoreleasepool {
         NSApplication* app = [NSApplication sharedApplication];
-        g_delegate = [[MirrorAppDelegate alloc] initWithName:name port:port pin:pin];
+        g_delegate = [[MirrorAppDelegate alloc] initWithName:name port:port pin:pin
+                                                       model:model keyfile:keyfile];
         [app setDelegate:g_delegate];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
         [app run];

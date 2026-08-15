@@ -65,6 +65,9 @@ public:
     /// 设置 AES-128-CTR 解密参数（视频也可能被加密）
     bool set_decryption_params(const std::string& aes_key_hex, const std::string& aes_iv_hex);
 
+    /// 设置 AES-128-CTR 解密参数（字节数组版，AP2 密钥派生结果）
+    bool set_decryption_key(const uint8_t key[16], const uint8_t iv[16]);
+
     /// 对端地址（可选，用于 RR）
     void set_remote_address(const std::string& ip, int port) {
         sender_ip_ = ip; sender_port_ = port;

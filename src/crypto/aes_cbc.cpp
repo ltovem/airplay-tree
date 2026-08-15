@@ -271,6 +271,22 @@ bool AesCbc::decrypt(const uint8_t iv[16], const uint8_t* in, size_t in_len,
     return true;
 }
 
+bool AesCbc::decrypt_raw(const uint8_t iv[16], const uint8_t* in, size_t in_len,
+                         uint8_t* out) {
+    if (!ready_ || !in || !out || !iv) return false;
+    if (in_len == 0 || in_len % 16 != 0) return false;
+    size_t nblocks = in_len / 16;
+    uint8_t prev[16];
+    std::memcpy(prev, iv, 16);
+    for (size_t b = 0; b < nblocks; ++b) {
+        uint8_t dec[16];
+        aes128_decrypt_block(round_keys_, &in[b*16], dec);
+        for (int i = 0; i < 16; ++i) out[b*16 + i] = dec[i] ^ prev[i];
+        std::memcpy(prev, &in[b*16], 16);
+    }
+    return true;
+}
+
 std::vector<uint8_t> AesCbc::encrypt_vec(const uint8_t iv[16], const uint8_t* in, size_t len) {
     size_t pad = 16 - (len % 16);
     size_t cap = len + pad;

@@ -316,9 +316,8 @@ static std::vector<uint8_t> make_minimal_bplist() {
     std::vector<uint8_t> b;
     b.insert(b.end(), {'b','p','l','i','s','t','0','0'}); // 8 bytes header
     // object 0 (offset 8): 空 dict
-    b.push_back(0xD0);        // marker array count 0? No — dict 0xE0
-    // 纠正：空 dict = 0xE0；空 array = 0xD0。上面错误：我们需要空 dict。
-    b.back() = 0xE0;  // 改为空 dict
+    // 标准 bplist（Apple CFBinaryPlist）：array=0xA0-0xAF，dict=0xD0-0xDF
+    b.push_back(0xD0);        // 空 dict = 0xD0
     // offset table (offset 9): 单字节 0x08 (obj0 在偏移 8)
     b.push_back(0x08);
     // Trailer 起始 = offset 10
@@ -408,3 +407,64 @@ TEST(AirplayPlist, ActionDict_PlayPause) {
     EXPECT_STREQ(act.get_string("command").c_str(), "playPause");
     EXPECT_EQ(act.get_int("timestamp"), int64_t(0x12345678LL));
 }
+
+/* ====================================================================
+ *                    Binary plist 序列化 roundtrip
+ * ==================================================================== */
+
+TEST(BinaryPlist, SerializeRoundtrip_SetupResponse) {
+    // 模拟 AP2 SETUP 响应：timingPort / eventPort / streams[{dataPort,type}]
+    auto resp = PlistValue::make_dict();
+    resp.dict()["timingPort"] = PlistValue::make_int(5003);
+    resp.dict()["eventPort"]  = PlistValue::make_int(0);
+    auto streams = PlistValue::make_array();
+    auto s1 = PlistValue::make_dict();
+    s1.dict()["dataPort"] = PlistValue::make_int(5000);
+    s1.dict()["type"]     = PlistValue::make_int(96);
+    streams.array().push_back(s1);
+    auto s2 = PlistValue::make_dict();
+    s2.dict()["dataPort"] = PlistValue::make_int(5004);
+    s2.dict()["type"]     = PlistValue::make_int(110);
+    streams.array().push_back(s2);
+    resp.dict()["streams"] = streams;
+
+    std::vector<uint8_t> bytes;
+    EXPECT_TRUE(serialize_binary_plist(resp, bytes));
+    EXPECT_GT(bytes.size(), (size_t)40);  // header + trailer
+    EXPECT_EQ(memcmp(bytes.data(), "bplist00", 8), 0);
+
+    // 用自家解析器 roundtrip，确认结构无损失
+    PlistValue back;
+    EXPECT_TRUE(parse_binary_plist(bytes.data(), bytes.size(), back));
+    EXPECT_TRUE(back.is_dict());
+    EXPECT_EQ(back.get_int("timingPort"), int64_t(5003));
+    EXPECT_EQ(back.get_int("eventPort"), int64_t(0));
+    const PlistValue& bs = back.get("streams");
+    EXPECT_TRUE(bs.is_array());
+    EXPECT_EQ(bs.array().size(), size_t(2));
+    EXPECT_EQ(bs.array()[0].get_int("dataPort"), int64_t(5000));
+    EXPECT_EQ(bs.array()[0].get_int("type"), int64_t(96));
+    EXPECT_EQ(bs.array()[1].get_int("dataPort"), int64_t(5004));
+    EXPECT_EQ(bs.array()[1].get_int("type"), int64_t(110));
+}
+
+TEST(BinaryPlist, SerializeRoundtrip_DataAndLongString) {
+    // 覆盖 data 类型和 >=15 字节长字符串（扩展长度编码路径）
+    auto d = PlistValue::make_dict();
+    std::vector<uint8_t> payload(72);
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = (uint8_t)i;
+    d.dict()["ekey"] = PlistValue::make_data(payload);
+    d.dict()["deviceID"] = PlistValue::make_string("AA:BB:CC:DD:EE:FF-0123456789");
+
+    std::vector<uint8_t> bytes;
+    EXPECT_TRUE(serialize_binary_plist(d, bytes));
+    PlistValue back;
+    EXPECT_TRUE(parse_binary_plist(bytes.data(), bytes.size(), back));
+    EXPECT_TRUE(back.is_dict());
+    EXPECT_EQ(back.get("ekey").as_data().size(), size_t(72));
+    EXPECT_EQ(back.get("ekey").as_data()[0], (uint8_t)0);
+    EXPECT_EQ(back.get("ekey").as_data()[71], (uint8_t)71);
+    EXPECT_STREQ(back.get_string("deviceID").c_str(),
+                 "AA:BB:CC:DD:EE:FF-0123456789");
+}
+

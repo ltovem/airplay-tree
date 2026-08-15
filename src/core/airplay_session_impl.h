@@ -51,11 +51,6 @@ public:
     /// Allocate a video data port; returns 0 on fail
     uint16_t allocate_video_port(uint16_t port_min, uint16_t port_max,
                                   int remote_data_port = 0);
-    /// 已分配的本地视频 data 端口（0 表示未分配）
-    uint16_t video_data_port() const { return video_local_port_; }
-    /// RTSP SETUP 计数：第 1 次 = 音频，之后 = 视频（客户端先 SETUP 音频再 SETUP 视频）
-    int setup_count() const { return setup_count_; }
-    void note_setup() { setup_count_++; }
 
     /// Configure audio / video codec (after ANNOUNCE SDP parsing)
     void configure_audio(const net::SdpInfo& sdp);
@@ -96,6 +91,24 @@ public:
     /// FairPlay accessor
     FairPlaySap& fairplay() { return fp_; }
 
+    // ---- AirPlay 2 SETUP 参数（RECORD 后解密 RTP 用）----
+    /// 保存 AP2 SETUP 里携带的 FairPlay 加密 AES key(72B) 与 IV(16B)
+    void set_ap2_keys(const std::vector<uint8_t>& ekey, const std::vector<uint8_t>& eiv) {
+        ap2_ekey_ = ekey;
+        ap2_eiv_ = eiv;
+    }
+    const std::vector<uint8_t>& ap2_ekey() const { return ap2_ekey_; }
+    const std::vector<uint8_t>& ap2_eiv()  const { return ap2_eiv_; }
+    /// 保存镜像/视频流的 streamConnectionID（视频 AES-CTR 密钥派生用）
+    void set_stream_connection_id(uint64_t id) { stream_connection_id_ = id; }
+    uint64_t stream_connection_id() const { return stream_connection_id_; }
+
+    /// 派生媒体密钥（AP2）：fairplay_sap_decrypt(keymsg, ekey) → raw，
+    /// 音频密钥 = SHA512(raw||ecdh_secret)[0:16]；
+    /// 视频 key/iv = SHA512("AirPlayStreamKey/IV{id}"||audio_key)[0:16]。
+    /// RECORD（start_streaming）前调用；成功后可配置 RTP 解密。
+    void derive_media_keys();
+
 private:
     void on_rtp_packet(const net::RtpAudioPacket& pkt);
     void on_video_frame(const VideoFrame& f);
@@ -116,15 +129,12 @@ private:
     int rtp_local_ports_[3] = {0,0,0};
     net::VideoRtpReceiver video_rtp_;
     uint16_t video_local_port_ = 0;
-    int setup_count_ = 0; // RTSP SETUP 次数（0=未 SETUP，1=音频，2+=视频）
 
     // Audio pipeline
     codec::AlacDecoder alac_;
     codec::AudioBuffer pcm_buffer_;
     AudioConfig audio_cfg_;
     std::string codec_mode_;
-    // AAC-ELD（屏幕镜像常用）：库不做内置解码，原始帧透传给渲染器
-    bool aac_compressed_ = false;
     std::atomic<bool> playing_{false};
     std::atomic<bool> video_playing_{false};
 
@@ -145,6 +155,15 @@ private:
 
     // FairPlay SAP
     FairPlaySap fp_;
+
+    // ---- AirPlay 2 密钥材料（来自 SETUP bplist）----
+    std::vector<uint8_t> ap2_ekey_;       ///< 72B FairPlay 加密 AES key
+    std::vector<uint8_t> ap2_eiv_;        ///< 16B AES-CBC IV
+    uint64_t stream_connection_id_ = 0;   ///< 镜像/视频流连接 ID
+    uint8_t audio_key_[16] = {0};         ///< 最终音频 AES 密钥（CBC）
+    uint8_t video_key_[16] = {0};         ///< 视频 AES-CTR key
+    uint8_t video_iv_[16]  = {0};         ///< 视频 AES-CTR IV
+    bool    media_keys_ready_ = false;    ///< 密钥派生是否成功
 
     // Stats
     mutable std::mutex stats_mu_;

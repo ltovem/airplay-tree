@@ -147,16 +147,17 @@ void HttpServer::accept_worker() {
             connections_[id] = conn;
         }
         AP2_LOGI("http: connection %lu from %s", (unsigned long)id, addr.to_string().c_str());
-        // Detached worker thread per connection。
-        // 注意不能用"线程内 delete 自己的 Thread 包装对象"模式：
-        // Thread::start 的包装 lambda 在线程函数返回后还要写 this->running_，
-        // 若线程函数里 delete 了对象，就是对已释放内存写入（ASan: use-after-free），
-        // 还会连锁造成堆损坏。直接使用裸 std::thread + detach 最安全。
+        // Detached worker thread per connection
+        platform::Thread* t = new platform::Thread();
         std::weak_ptr<Connection> wconn = conn;
         HttpServer* self = this;
-        std::thread([self, wconn] {
+        t->start([self, wconn, t] {
+            // 必须先 detach 再 delete：线程在自己体内析构 Thread 对象时，
+            // 析构函数会 join() 自身线程 → self-join 异常 → 进程崩溃
+            t->detach();
             if (auto c = wconn.lock()) self->connection_worker(c);
-        }).detach();
+            delete t;
+        }, "ap2-http-conn");
     }
 }
 

@@ -76,3 +76,8 @@ compile_flags.txt
 *.temp
 *.log
 logs/
+
+# ---- 本地参考材料（勿提交）----
+scratch/
+*.apk
+*.pcap

@@ -62,6 +62,86 @@ struct SdpInfo {
 bool parse_sdp(const std::string& sdp, SdpInfo& out);
 
 /*!
+ * @brief 处理 FairPlay SAP setup 请求（/fp-setup 用）
+ *
+ * 协议字段：req[4]=版本(须为 3)，req[6]=seq（1=setup1，3=setup2），
+ *           req[14]=mode（0..3，仅 setup1 用）。
+ * seq==1 → 回 142B FPLY server hello；seq==3 → 回 12B 头 + 请求末尾 20B。
+ * 注意 seq==3 的完整 164B 请求体（keymsg）需由调用方保存，供后续
+ * fairplay_sap_decrypt 解密媒体 AES 密钥。
+ *
+ * @param body 请求体
+ * @param len  请求长度
+ * @return 响应体；空表示无法识别
+ */
+std::vector<uint8_t> handle_fairplay_setup(const uint8_t* body, size_t len);
+
+/*!
+ * @brief AP2 SETUP 请求中的一个 stream 描述
+ *
+ * 来自 SETUP 请求体 streams 数组元素。常见 type：
+ *   - 96  = audio（带 controlPort/ct/spf/audioFormat/isMedia/usingScreen）
+ *   - 110 = mirroring 屏幕镜像（带 streamConnectionID）
+ *   - 98  = video（AirPlay 视频播放，带 streamConnectionID）
+ */
+struct Ap2StreamReq {
+    uint64_t type = 0;                  ///< 流类型：96 audio / 110 mirroring
+    uint64_t control_port = 0;          ///< audio：客户端控制(RTCP)端口
+    uint64_t stream_connection_id = 0;  ///< mirroring/video：流连接 ID（视频密钥派生用）
+    uint64_t ct = 0;                    ///< audio codec type
+    uint64_t spf = 0;                   ///< samples per frame
+};
+
+/*!
+ * @brief AP2 SETUP 请求（binary plist 解析结果）
+ *
+ * 请求体格式（Apple 官方，见 UxPlay raop_handler_setup）：
+ *   {
+ *     ekey:  data(72B),   // FairPlay 加密的 AES 密钥（需 decrypt 后与 ecdh_secret 哈希）
+ *     eiv:   data(16B),   // AES-CBC IV
+ *     streams: [ {type, controlPort|streamConnectionID, ct, spf, ...} ],
+ *     timingProtocol: string ("NTP"/"None"/"PTP"),
+ *     timingPort: uint,   // 客户端 timing 端口
+ *     deviceID/model/name: string,
+ *     isRemoteControlOnly: bool
+ *   }
+ */
+struct Ap2SetupRequest {
+    std::vector<uint8_t> ekey;          ///< 72B 加密 AES key
+    std::vector<uint8_t> eiv;           ///< 16B IV
+    std::vector<Ap2StreamReq> streams;  ///< 请求的流
+    uint64_t timing_port = 0;           ///< 客户端 timing 端口
+    std::string timing_protocol;        ///< "NTP" / "None" / "PTP"
+    bool is_remote_control_only = false;///< 是否仅远程控制（无媒体）
+};
+
+/*!
+ * @brief AP2 SETUP 响应中的一个 stream 描述
+ */
+struct Ap2StreamResp {
+    uint64_t type = 0;                  ///< 与请求相同：96 audio / 110 mirroring
+    int data_port = 0;                  ///< 本地 RTP data 端口
+    int control_port = 0;               ///< 本地 RTCP control 端口（仅 audio）
+};
+
+/*!
+ * @brief AP2 SETUP 响应（将序列化为 binary plist）
+ *
+ * 响应体格式：
+ *   {
+ *     timingPort: uint,   // 本地 timing 端口（NTP）
+ *     eventPort:  uint,   // 事件端口（0 = 不支持，UxPlay 同款）
+ *     streams: [ {dataPort, controlPort?, type} ]
+ *   }
+ */
+struct Ap2SetupResponse {
+    bool ok = false;                    ///< false → 回 453 拒绝
+    int timing_port = 0;                ///< 本地 timing 端口
+    int event_port = 0;                 ///< 事件端口（0）
+    std::vector<Ap2StreamResp> streams; ///< 各流的本地端口
+};
+
+/*!
  * @brief Pairing / Pin challenge context
  */
 struct RtspAuthContext {
@@ -80,6 +160,13 @@ struct RtspHandlers {
     /// and fill allocated_ports (size=3). Return true to accept.
     std::function<bool(uint64_t conn_id, int remote[3], int allocated_ports[3])> on_setup;
 
+    // ---- AirPlay 2 (binary plist) SETUP ----
+    // iOS 镜像/音频用 AP2 流程：SETUP 请求体是 binary plist
+    // （ekey/eiv/streams/timingProtocol/timingPort 等），响应也必须是
+    // binary plist（timingPort/eventPort/streams）。参考 UxPlay/RPiPlay。
+    // 这些结构体定义在 rtsp_server.h 下方。
+    std::function<Ap2SetupResponse(uint64_t conn_id, const Ap2SetupRequest& req)> on_setup_ap2;
+
     /// Called on RECORD (playback start)
     std::function<void(uint64_t conn_id)> on_record;
 
@@ -94,8 +181,21 @@ struct RtspHandlers {
     std::function<void(uint64_t conn_id, const std::string& params)> on_set_param;
 
     /// Pair-setup: return plist body for response (airplay-specific)
-    std::function<std::vector<uint8_t>(uint64_t conn_id, const uint8_t* body, size_t len)> on_pair_setup;
-    std::function<std::vector<uint8_t>(uint64_t conn_id, const uint8_t* body, size_t len)> on_pair_verify;
+    /// peer_ip 为对端 IP（配对状态按连接/IP 记，避免不同客户端互相污染）
+    std::function<std::vector<uint8_t>(uint64_t conn_id, const std::string& peer_ip,
+                                       const uint8_t* body, size_t len)> on_pair_setup;
+    std::function<std::vector<uint8_t>(uint64_t conn_id, const std::string& peer_ip,
+                                       const uint8_t* body, size_t len)> on_pair_verify;
+
+    /// /auth-setup（MFi 握手）。正常情况下 iOS 只在 features bit26
+    /// (HasUnifiedAdvertiserInfo) 置位时才发起；我们 bit26=0，iOS 不会走到这里。
+    std::function<std::vector<uint8_t>(uint64_t conn_id, const std::string& peer_ip,
+                                       const uint8_t* body, size_t len)> on_auth_setup;
+
+    /// /fp-setup（FairPlay SAP 媒体加密握手）。返回 FPLY 响应体；
+    /// 实现方应保存 seq==3 时的 164B keymsg（音频/视频密钥解密用）。
+    std::function<std::vector<uint8_t>(uint64_t conn_id,
+                                       const uint8_t* body, size_t len)> on_fairplay_setup;
 
     /// Info endpoint response body
     std::function<std::vector<uint8_t>(uint64_t conn_id)> on_info;

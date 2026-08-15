@@ -90,6 +90,15 @@ bool RtpReceiver::set_decryption_params(const std::string& aes_key_hex,
     return ok;
 }
 
+void RtpReceiver::set_cbc_decryption(const uint8_t* key, const uint8_t* iv) {
+    if (!key || !iv) { cbc_ready_ = false; return; }
+    if (cbc_.set_key(key)) {
+        std::memcpy(cbc_iv_, iv, 16);
+        cbc_ready_ = true;
+        AP2_LOGI("rtp: AES-128-CBC decryption configured (AP2 SETUP ekey/eiv)");
+    }
+}
+
 void RtpReceiver::set_remote_address(const std::string& client_ip, int remote_ports[3]) {
     sender_ip_ = client_ip;
     // remote_ports[0] = audio data port on sender (接收端从不主动发 data)
@@ -226,8 +235,20 @@ void RtpReceiver::receiver_worker() {
                 pkt.recv_us = platform::time_now_us();
                 pkt.payload.assign(buf + off, buf + r.bytes);
 
-                // AES-128-CTR 解密：如果密钥已设置，直接在 pkt.payload 上 in-place 解密
-                if (aes_.is_ready() && !pkt.payload.empty()) {
+                // 解密（两种模式）：
+                //   - AP2（SETUP bplist ekey/eiv）：AES-CBC，payload 从 0 起整块
+                //     加密，最后不足 16B 的部分原样透传（UxPlay raop_buffer 同款）
+                //   - AP1（ANNOUNCE SDP a=aeskey/a=aesiv）：AES-CTR 逐包
+                if (cbc_ready_ && !pkt.payload.empty()) {
+                    size_t enc = pkt.payload.size() / 16 * 16;
+                    if (enc > 0) {
+                        std::vector<uint8_t> plain(enc);
+                        if (cbc_.decrypt_raw(cbc_iv_, pkt.payload.data(), enc, plain.data())) {
+                            plain.insert(plain.end(), pkt.payload.begin() + enc, pkt.payload.end());
+                            pkt.payload.swap(plain);
+                        }
+                    }
+                } else if (aes_.is_ready() && !pkt.payload.empty()) {
                     aes_.process(pkt.payload.data(), pkt.payload.data(), pkt.payload.size());
                 }
 

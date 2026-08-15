@@ -71,6 +71,23 @@ public:
                  uint8_t* out, size_t* out_len);
 
     /*!
+     * @brief AES-128-CBC 原始解密（不带 PKCS#7 填充处理）
+     *
+     * AirPlay 音频 RTP payload 的 AES-CBC 是"整块"加密、无填充：
+     * 加密长度 = payload/16*16，最后不足 16 字节的部分原样透传。
+     * 解密后明文长度 == in_len。
+     *
+     * @param iv     16 字节 IV（SETUP bplist 的 eiv）
+     * @param in     密文（长度必须是 16 倍数）
+     * @param in_len 密文字节数
+     * @param out    输出明文（容量 >= in_len）
+     * @return true 成功
+     */
+    bool decrypt_raw(const uint8_t iv[16],
+                     const uint8_t* in, size_t in_len,
+                     uint8_t* out);
+
+    /*!
      * @brief 便捷 vector 版：加密
      */
     std::vector<uint8_t> encrypt_vec(const uint8_t iv[16], const uint8_t* in, size_t len);

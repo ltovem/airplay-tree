@@ -57,8 +57,16 @@ struct AudioConfig {
  *
  * 这些字段会写入 Bonjour TXT record。发送端（iPhone/iTunes）会根据
  * TXT 中 features / model / pk 等决定 UI 展示图标以及是否启用加密。
- * 参考：非官方 AirPlay2 逆向文档中 feature flags 的 bit 定义，
- * 默认 features = 0x5A7FFFF7 基本覆盖所有音频功能。
+ * 参考：非官方 AirPlay2 逆向文档中 feature flags 的 bit 定义
+ * （openairplay/airplay-spec src/features.md）：
+ *   bit0=Video bit7=Screen bit9=Audio bit12=FPSAPv2pt5_AES_GCM
+ *   bit14=Authentication4 bit19/20=AudioFormat2/3（AirPlay2 必需）
+ *   bit23=Authentication1(RSA legacy) bit26=HasUnifiedAdvertiserInfo
+ *   bit27=SupportsLegacyPairing bit30=RAOP
+ * 默认 features 对齐 UxPlay 的 FEATURES_1=0x5A7FFEE6（实测 iOS 可投屏），
+ * 关键点：bit26 必须为 0 —— 置 1 会宣告"MFi 统一广告信息"，
+ * iOS 会强制走 /auth-setup（MFi 握手），需要真实 MFi 证书 + RSA-1024 签名，
+ * 开源接收器没有该证书，iOS 校验失败直接断开。
  */
 struct DeviceInfo {
     std::string name;        ///< 显示名（UI 上看到的音箱名）
@@ -68,16 +76,23 @@ struct DeviceInfo {
     std::string serial_number;              ///< 序列号；未开启 FairPlay 时可留空
     uint16_t    port     = 7000;            ///< AirPlay RTSP 控制端口（默认 7000；改了要同时改 ServerConfig）
     // 为什么是 32 位？：按 AirPlay 协议 feature 位已经超过 uint16
-    // （bit24=has video、bit31=requires auth 等），必须用 uint32。
-    // 0x5A7FFFF7 = 默认音频特性 + bit24(VIDEO)=1 + bit27(HAS_H264)=1
-    // + bit31(RQR_AUTH) 仍为 0（要认证请自行打开 + 配置证书）。
-    uint32_t    features = 0x5F7FFFF7;      ///< Feature flags 位图
+    // （bit0=video、bit7=screen、bit26=MFi 广告等），必须用 uint32。
+    // 0x5A7FFEE6 = UxPlay 实测可用的值：视频/屏幕镜像/音频/FPSAP/legacy配对/RAOP 全开，
+    // 且 bit26(HasUnifiedAdvertiserInfo)=0 避免 iOS 触发 MFi /auth-setup。
+    uint32_t    features = 0x5A7FFEE6;      ///< Feature flags 位图
     uint8_t     protocol_version = 1;       ///< AirPlay 协议版本：1 = AP1/AP2 兼容
     bool        supports_audio = true;      ///< 宣告支持音频（关闭后仅能做屏幕镜像接收器）
     bool        supports_video = true;      ///< 宣告支持视频（镜像 / HLS 拉流）
     bool        supports_photo = true;      ///< 宣告支持照片投射
     bool        requires_encryption = false;///< 是否要求 FairPlay 加密（需要 MFi 证书，当前留 false）
     std::string pin_code;                   ///< 4 位数字 PIN；非空时每次配对要输入
+    /// 本设备 Ed25519 公钥的 base64（RFC 4648，无换行）。
+    /// 库内部根据 pairing 身份自动填充，写入两处：
+    ///   1. /info plist 的 <key>pk</key><data>...</data>
+    ///   2. _airplay._tcp TXT 的 pk= 字段
+    /// 发送端（iPhone/iPad）发现设备后，用该公钥做 AirPlay legacy 配对
+    /// （pair-setup/pair-verify），为空时 iOS 认为设备不可配、反复探测后断连。
+    std::string public_key_b64;
 };
 
 /*!
@@ -101,6 +116,12 @@ struct ServerConfig {
     uint32_t     buffer_ms  = 2000;         ///< 抖动缓冲 + 渲染缓冲合计目标延迟（毫秒）
     bool         enable_logging = true;     ///< 是否启用内部日志；配合 ServerCallbacks::on_log 使用
     int          log_level = 2;             ///< 0=error 1=warn 2=info 3=debug 4=trace
+    // Ed25519 身份种子文件的路径（可选）。
+    // AirPlay legacy 配对要求本机持有一对稳定的 Ed25519 密钥：iOS 首次配对后
+    // 会记住该公钥，若每次重启公钥都变，设备名会反复弹出"重新配对"。
+    // 置为空 = 每次进程启动生成新身份（功能可用但不稳定）；建议桌面端指向
+    // ~/Library/Application Support/<app>/identity.key 之类的持久路径。
+    std::string  identity_key_path;         ///< 32 字节随机种子文件；不存在则自动创建
 };
 
 /*!

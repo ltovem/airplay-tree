@@ -2,15 +2,60 @@
  * @file airplay_session_impl.cpp
  */
 #include "airplay_session_impl.h"
+#include "airplay_server_impl.h"
 #include "../platform/platform_log.h"
 #include "../platform/platform_time.h"
-#include "../util/plist.h"   // util::base64_decode（SDP sprop-parameter-sets）
+#include "../crypto/fairplay_sap.h"
+#include "../crypto/sha512.h"
 #include <cstring>
+#include <cstdio>      // std::snprintf（视频密钥派生字符串）
 #include <utility>     // std::swap（声道交错转换）
-#include <vector>
-#include <string>
 
 namespace airplay2 {
+
+void SessionImpl::derive_media_keys() {
+    if (!server_) return;
+    media_keys_ready_ = false;
+    auto keymsg = server_->fairplay_keymsg(id_);
+    if (keymsg.size() < 164 || ap2_ekey_.size() < 72 || ap2_eiv_.size() < 16) {
+        AP2_LOGW("session %lu: media keys unavailable (keymsg=%zu ekey=%zu eiv=%zu)",
+                 (unsigned long)id_, keymsg.size(), ap2_ekey_.size(), ap2_eiv_.size());
+        return;
+    }
+    uint8_t raw[16];
+    if (!crypto::fairplay_sap_decrypt(keymsg.data(), ap2_ekey_.data(), raw)) {
+        AP2_LOGW("session %lu: fairplay_sap_decrypt failed", (unsigned long)id_);
+        return;
+    }
+    // 音频最终密钥 = SHA512(raw || ecdh_secret) 前 16B（UxPlay 同款）
+    auto ecdh = server_->pairing().ecdh_secret(id_);
+    crypto::Sha512 h;
+    h.update(raw, 16);
+    if (!ecdh.empty()) h.update(ecdh.data(), ecdh.size());
+    uint8_t digest[64];
+    h.final(digest);
+    std::memcpy(audio_key_, digest, 16);
+
+    // 视频 key/iv = SHA512("AirPlayStreamKey/IV{id}" || audio_key) 前 16B
+    char kb[64], ib[64];
+    std::snprintf(kb, sizeof(kb), "AirPlayStreamKey%llu",
+                  (unsigned long long)stream_connection_id_);
+    std::snprintf(ib, sizeof(ib), "AirPlayStreamIV%llu",
+                  (unsigned long long)stream_connection_id_);
+    crypto::Sha512 k, v;
+    k.update((const uint8_t*)kb, std::strlen(kb));
+    k.update(audio_key_, 16);
+    k.final(digest);
+    std::memcpy(video_key_, digest, 16);
+    v.update((const uint8_t*)ib, std::strlen(ib));
+    v.update(audio_key_, 16);
+    v.final(digest);
+    std::memcpy(video_iv_, digest, 16);
+
+    media_keys_ready_ = true;
+    AP2_LOGI("session %lu: media keys derived (audio CBC + video CTR, connID=%llu)",
+             (unsigned long)id_, (unsigned long long)stream_connection_id_);
+}
 
 SessionImpl::SessionImpl(uint64_t id, ServerImpl* server,
                          IAudioRenderer* audio_renderer, IVideoRenderer* video_renderer)
@@ -88,17 +133,8 @@ void SessionImpl::configure_audio(const net::SdpInfo& sdp) {
         } else if (lower.find("l16") != std::string::npos || lower == "pcm") {
             audio_cfg_.format = AudioFormat::PCM16LE;
         } else if (lower.find("mpeg4") != std::string::npos || lower == "aac") {
-            // AAC-ELD（屏幕镜像常用）：库没有内置 AAC 解码器，把原始压缩帧
-            // 透传给渲染器（AudioToolbox / MediaCodec / FFmpeg）自行解码。
-            // 这里仍把 audio_cfg_ 置为 PCM16LE，保证 pcm_buffer_ 配置有效；
-            // 真正的压缩参数通过 on_compressed_config 告知渲染器。
-            aac_compressed_ = true;
+            // For AAC: output PCM16 stub (user can extend with external decoder)
             audio_cfg_.format = AudioFormat::PCM16LE;
-            if (audio_renderer_) {
-                audio_renderer_->on_compressed_config(codec_mode_, sdp.fmtp, audio_cfg_);
-            }
-            AP2_LOGI("session %lu: AAC compressed passthrough enabled (fmtp=%s)",
-                     (unsigned long)id_, sdp.fmtp.c_str());
         }
     }
     pcm_buffer_.set_config(audio_cfg_);
@@ -110,6 +146,15 @@ void SessionImpl::start_streaming() {
     if (state_.load() == AirPlaySession::State::PLAYING) return;
     playback_stop_.store(false);
     rtp_.set_packet_callback([this](const net::RtpAudioPacket& p) { on_rtp_packet(p); });
+    // AP2 路径：SETUP 带了 ekey/eiv → 派生媒体密钥并配置 RTP 解密
+    if (ap2_ekey_.size() >= 72) {
+        derive_media_keys();
+        if (media_keys_ready_) {
+            rtp_.set_cbc_decryption(audio_key_, ap2_eiv_.data());
+            if (video_local_port_ != 0)
+                video_rtp_.set_decryption_key(video_key_, video_iv_);
+        }
+    }
     rtp_.start();
     playback_thread_.start([this] { playback_worker(); }, "ap2-playback");
     playing_.store(true);
@@ -171,14 +216,7 @@ void SessionImpl::on_rtp_packet(const net::RtpAudioPacket& pkt) {
     std::string lower_mode = codec_mode_;
     for (char& c : lower_mode) c = (char)std::tolower((unsigned char)c);
 
-    if (aac_compressed_) {
-        // AAC-ELD：原样透传给渲染器解码（不写 PCM 缓冲，播放器由渲染器自管）
-        if (audio_renderer_) {
-            audio_renderer_->on_compressed_audio(pkt.payload.data(),
-                                                 pkt.payload.size(), pkt.timestamp);
-        }
-        samples = pkt.payload.size();
-    } else if (alac_.is_configured() &&
+    if (alac_.is_configured() &&
         (lower_mode.find("applelossless") != std::string::npos || lower_mode == "alac")) {
         int64_t used = alac_.decode_frame(pkt.payload.data(), pkt.payload.size(), pcm);
         if (used < 0) {
@@ -259,85 +297,6 @@ uint16_t SessionImpl::allocate_video_port(uint16_t port_min, uint16_t port_max,
     return p;
 }
 
-/*!
- * @brief 解析 fmtp 中的 sprop-parameter-sets（H.264）或 sprop-vps/sps/pps（H.265）
- *
- * AirPlay 屏幕镜像的 SDP 视频 fmtp 形如：
- *   a=fmtp:97 profile-level-id=42e01f;sprop-parameter-sets=Z0LAH5oBQBboQ==,aM4xEg==
- * SPS/PPS 是 base64 编码的裸 NAL 负载，需要逐个解码并包上 Annex-B 起始码，
- * 组成 CMFormatDescription 需要的参数集字节流（codec_extra）。
- *
- * @param fmtp  video_fmtp 原串（可能含多个 key=value; 段）
- * @param codec 视频编码类型（决定参数集 key 名）
- * @param out   Annex-B 拼接结果（追加到尾部；未解析到时保持原样）
- */
-static void parse_sprop_parameter_sets(const std::string& fmtp,
-                                       airplay2::VideoCodec codec,
-                                       std::vector<uint8_t>& out) {
-    using airplay2::util::base64_decode;
-    // 切分 ';' 段，每段 "key=value"（值可能带引号）
-    std::vector<std::pair<std::string, std::string>> kvs;
-    size_t pos = 0;
-    while (pos <= fmtp.size()) {
-        size_t semi = fmtp.find(';', pos);
-        std::string seg = fmtp.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
-        size_t eq = seg.find('=');
-        if (eq != std::string::npos) {
-            std::string k = seg.substr(0, eq);
-            std::string v = seg.substr(eq + 1);
-            // 去空白与首尾引号
-            auto trim = [](std::string& s) {
-                while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '"')) s.erase(s.begin());
-                while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '"')) s.pop_back();
-            };
-            trim(k); trim(v);
-            if (!k.empty()) kvs.emplace_back(std::move(k), std::move(v));
-        }
-        if (semi == std::string::npos) break;
-        pos = semi + 1;
-    }
-
-    auto append_nal = [&out](const std::string& b64) {
-        std::vector<uint8_t> nal;
-        if (!base64_decode(b64, nal) || nal.empty()) return;
-        // Annex-B start code（4 字节）
-        out.insert(out.end(), {0x00, 0x00, 0x00, 0x01});
-        out.insert(out.end(), nal.begin(), nal.end());
-    };
-
-    if (codec == airplay2::VideoCodec::H265_HEVC) {
-        // 顺序：VPS → SPS → PPS
-        for (const char* key : {"sprop-vps", "sprop-sps", "sprop-pps"}) {
-            for (auto& kv : kvs) {
-                if (kv.first != key) continue;
-                size_t start = 0;
-                while (start <= kv.second.size()) {
-                    size_t comma = kv.second.find(',', start);
-                    std::string b64 = kv.second.substr(
-                        start, comma == std::string::npos ? std::string::npos : comma - start);
-                    append_nal(b64);
-                    if (comma == std::string::npos) break;
-                    start = comma + 1;
-                }
-            }
-        }
-    } else {
-        // H.264 / MJPEG：sprop-parameter-sets=...,...
-        for (auto& kv : kvs) {
-            if (kv.first != "sprop-parameter-sets") continue;
-            size_t start = 0;
-            while (start <= kv.second.size()) {
-                size_t comma = kv.second.find(',', start);
-                std::string b64 = kv.second.substr(
-                    start, comma == std::string::npos ? std::string::npos : comma - start);
-                append_nal(b64);
-                if (comma == std::string::npos) break;
-                start = comma + 1;
-            }
-        }
-    }
-}
-
 void SessionImpl::configure_video(const net::SdpInfo& sdp) {
     video_cfg_.codec = sdp.video_codec;
     video_cfg_.width  = (uint32_t)sdp.video_width;
@@ -346,17 +305,11 @@ void SessionImpl::configure_video(const net::SdpInfo& sdp) {
     video_cfg_.fps_den = sdp.video_fps > 0 ? 1 : 0;
     video_rtp_.set_codec(sdp.video_codec);
 
-    // 若 SDP video_fmtp 带 sprop-parameter-sets（H.264 SPS/PPS base64），
-    // 解码为 Annex-B 字节流存进 codec_extra，供渲染器直接构建格式描述符；
-    // 若没有（部分发送端只在 RTP 里带内发送参数集），则留空走"带内缓存"回退。
+    // 若 SDP video_fmtp 带 sprop-parameter-sets（H.264 SPS/PPS base64），解码保存
+    // 简化：把 fmtp 直接作为 codec_extra（调用方也可自行解析）
     if (!sdp.video_fmtp.empty()) {
-        video_cfg_.codec_extra.clear();
-        parse_sprop_parameter_sets(sdp.video_fmtp, sdp.video_codec, video_cfg_.codec_extra);
+        video_cfg_.codec_extra.assign(sdp.video_fmtp.begin(), sdp.video_fmtp.end());
         video_rtp_.set_codec_data(video_cfg_.codec_extra);
-        if (!video_cfg_.codec_extra.empty()) {
-            AP2_LOGI("session %lu: video fmtp sprop decoded -> %zu bytes codec_extra",
-                     (unsigned long)id_, video_cfg_.codec_extra.size());
-        }
     }
     // AES key 从同一 SDP 取（AirPlay 对音视频用同一把 key）
     if (!sdp.aes_key.empty() || !sdp.aes_iv.empty()) {

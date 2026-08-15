@@ -145,8 +145,7 @@ static int base64_char_to_val(char c) {
  * @brief Base64 解码 —— 用于 plist <data> 标签 / SDP sprop-parameter-sets
  *
  * AirPlay /info 里没用到 <data>，但设备发送的某些 /action /event
- * 里有；H.264 的 SPS/PPS 也会以 base64 形式出现在 SDP fmtp 中。
- * 这是一个标准的 4 字符 → 3 字节解码器。
+ * 里有。这是一个标准的 4 字符 → 3 字节解码器。
  */
 bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
     out.clear();
@@ -578,13 +577,7 @@ static bool bplist_parse_object(const uint8_t* data, size_t len, uint64_t offset
             table[ref_id] = PlistValue::make_int((int64_t)be_read_varint(data + p, bytes));
             return true;
         }
-        case 0x0A: { // UTF-8 string (AirPlay 发送端非常常用)
-            if (p + count > len) return false;
-            table[ref_id] = PlistValue::make_string(
-                std::string((const char*)(data + p), (size_t)count));
-            return true;
-        }
-        case 0x0D: { // array: count 个 ref
+        case 0x0A: { // array: count 个 ref（标准 bplist：0xA0-0xAF = array）
             // 每个 ref = ref_size 字节
             const uint8_t* ot_start = offset_table_start;
             size_t n = (size_t)count;
@@ -600,7 +593,8 @@ static bool bplist_parse_object(const uint8_t* data, size_t len, uint64_t offset
             table[ref_id] = std::move(arr);
             return true;
         }
-        case 0x0E: { // dict (set form)：count keys + count vals refs
+        case 0x0D: { // dict（标准 bplist：0xD0-0xDF = dict）
+            // 布局 = count 个 key refs 后接 count 个 value refs
             const uint8_t* ot_start = offset_table_start;
             size_t n = (size_t)count;
             PlistValue dict = PlistValue::make_dict();
@@ -775,6 +769,210 @@ std::string serialize_xml_plist(const PlistValue& value) {
     serialize_value(value, out, 0);
     out += "</plist>\n";
     return out;
+}
+
+// ===================== Binary plist (bplist00) 序列化 =====================
+// 编码规则（与解析端 bplist_parse_object 互逆）：
+//   - 对象 = 1 字节 marker（高 4 位类型 + 低 4 位长度） + 载荷
+//   - 长度 >= 15 时 marker 低 4 位 = 0xF，随后 1 字节"长度字节数"(0x10|power) + 长度
+//   - array/dict 的引用（ref）字节数由总对象数决定，全文件统一
+//   - trailer 固定 32 字节：6 未用 + offset_size + ref_size +
+//     8B 对象数 + 8B 顶层对象 ID + 8B offset 表偏移
+
+namespace {
+
+// 统计对象总数（含 dict 的 key），用于决定 ref_size。
+// 不去重：每个节点都占一个对象槽，简单且互操作安全。
+size_t bplist_count_objects(const PlistValue& v) {
+    size_t n = 1; // 自身
+    switch (v.type()) {
+        case PlistType::ARRAY:
+            for (auto& c : v.array()) n += bplist_count_objects(c);
+            break;
+        case PlistType::DICT:
+            for (auto& kv : v.dict()) {
+                n += bplist_count_objects(PlistValue::make_string(kv.first));
+                n += bplist_count_objects(kv.second);
+            }
+            break;
+        default: break;
+    }
+    return n;
+}
+
+// 写入 int 长度（bplist 长度扩展字段：marker 后先 1 字节 0x10|power）
+void bplist_write_int(std::vector<uint8_t>& out, uint64_t v, int bytes) {
+    for (int i = bytes - 1; i >= 0; --i)
+        out.push_back((uint8_t)((v >> (8 * i)) & 0xFF));
+}
+
+// 在指定位置写入定长大端整数（回填 refs 用）
+void bplist_write_int_at(std::vector<uint8_t>& out, size_t pos, uint64_t v, int bytes) {
+    for (int i = bytes - 1; i >= 0; --i) out[pos + (size_t)i] = (uint8_t)((v >> (8 * i)) & 0xFF);
+}
+
+// 编码"长度"（长度 >= 15 时用扩展形式）
+void bplist_write_length(std::vector<uint8_t>& out, size_t n) {
+    if (n < 15) return; // 已写在 marker 低 4 位
+    int bytes = (n < 0x100) ? 1 : (n < 0x10000) ? 2 : (n < 0x100000000ULL) ? 4 : 8;
+    int power = 0;
+    while ((1 << power) < bytes) ++power;
+    out.push_back(0x10 | (uint8_t)power);
+    bplist_write_int(out, n, bytes);
+}
+
+// 递归编码一个对象，返回其对象 ID（= offsets.size() 分配前的大小）
+// 注意 array/dict 的 refs 必须紧跟 marker（解析端从 marker 后直接读 refs），
+// 所以采用"先写 marker+占位 refs，编码子对象后再回填"的顺序，保证
+// 子对象的 offset 不受后续插入影响。
+uint64_t bplist_encode(const PlistValue& v, std::vector<uint8_t>& body,
+                       std::vector<uint64_t>& offsets, int ref_size) {
+    uint64_t id = offsets.size();
+    offsets.push_back(body.size());
+
+    switch (v.type()) {
+        case PlistType::BOOL: {
+            body.push_back(v.as_bool() ? 0x09 : 0x08); // true / false
+            break;
+        }
+        case PlistType::INT: {
+            int64_t val = v.as_int();
+            int bytes = 1;
+            if (val < INT8_MIN || val > INT8_MAX) bytes = 2;
+            if (val < INT16_MIN || val > INT16_MAX) bytes = 4;
+            if (val < INT32_MIN || val > INT32_MAX) bytes = 8;
+            int power = 0;
+            while ((1 << power) < bytes) ++power;
+            body.push_back(0x10 | (uint8_t)power);
+            for (int i = bytes - 1; i >= 0; --i)
+                body.push_back((uint8_t)(((uint64_t)val >> (8 * i)) & 0xFF));
+            break;
+        }
+        case PlistType::REAL: {
+            body.push_back(0x23); // 8 字节 double
+            double d = v.as_real();
+            uint64_t u;
+            std::memcpy(&u, &d, 8);
+            for (int i = 7; i >= 0; --i)
+                body.push_back((uint8_t)((u >> (8 * i)) & 0xFF));
+            break;
+        }
+        case PlistType::DATE: {
+            // 解析端把 date 存成 Unix 秒；序列化回 Apple epoch（2001-01-01）
+            body.push_back(0x33);
+            double d = v.as_real() - kAppleCFAbsoluteTimeOffset;
+            uint64_t u;
+            std::memcpy(&u, &d, 8);
+            for (int i = 7; i >= 0; --i)
+                body.push_back((uint8_t)((u >> (8 * i)) & 0xFF));
+            break;
+        }
+        case PlistType::DATA: {
+            const auto& d = v.as_data();
+            body.push_back(d.size() < 15 ? (uint8_t)(0x40 | d.size()) : 0x4F);
+            if (d.size() >= 15) bplist_write_length(body, d.size());
+            body.insert(body.end(), d.begin(), d.end());
+            break;
+        }
+        case PlistType::STRING: {
+            const std::string& s = v.as_string();
+            body.push_back(s.size() < 15 ? (uint8_t)(0x50 | s.size()) : 0x5F);
+            if (s.size() >= 15) bplist_write_length(body, s.size());
+            body.insert(body.end(), s.begin(), s.end());
+            break;
+        }
+        case PlistType::ARRAY: {
+            const auto& arr = v.array();
+            // 标准 bplist：array marker = 0xA0-0xAF（Apple CFBinaryPlist 定义）
+            body.push_back(arr.size() < 15 ? (uint8_t)(0xA0 | arr.size()) : 0xAF);
+            if (arr.size() >= 15) bplist_write_length(body, arr.size());
+            size_t refs_pos = body.size();
+            for (size_t i = 0; i < arr.size(); ++i) // 占位 refs
+                for (int j = 0; j < ref_size; ++j) body.push_back(0);
+            std::vector<uint64_t> refs;
+            for (auto& c : arr) refs.push_back(bplist_encode(c, body, offsets, ref_size));
+            for (size_t i = 0; i < refs.size(); ++i)
+                bplist_write_int_at(body, refs_pos + i * (size_t)ref_size, refs[i], ref_size);
+            break;
+        }
+        case PlistType::DICT: {
+            const auto& d = v.dict();
+            // 标准 bplist：dict marker = 0xD0-0xDF（Apple CFBinaryPlist 定义）
+            body.push_back(d.size() < 15 ? (uint8_t)(0xD0 | d.size()) : 0xDF);
+            if (d.size() >= 15) bplist_write_length(body, d.size());
+            size_t refs_pos = body.size();
+            for (size_t i = 0; i < 2 * d.size(); ++i) // 占位 key refs + value refs
+                for (int j = 0; j < ref_size; ++j) body.push_back(0);
+            std::vector<uint64_t> key_refs, val_refs;
+            for (auto& kv : d) {
+                // 格式要求 key refs 排在 value refs 前
+                key_refs.push_back(bplist_encode(PlistValue::make_string(kv.first),
+                                                 body, offsets, ref_size));
+                val_refs.push_back(bplist_encode(kv.second, body, offsets, ref_size));
+            }
+            for (size_t i = 0; i < key_refs.size(); ++i)
+                bplist_write_int_at(body, refs_pos + i * (size_t)ref_size, key_refs[i], ref_size);
+            size_t vbase = refs_pos + key_refs.size() * (size_t)ref_size;
+            for (size_t i = 0; i < val_refs.size(); ++i)
+                bplist_write_int_at(body, vbase + i * (size_t)ref_size, val_refs[i], ref_size);
+            break;
+        }
+        case PlistType::NONE:
+        default:
+            body.push_back(0x00); // null
+            break;
+    }
+    return id;
+}
+
+} // namespace
+
+bool serialize_binary_plist(const PlistValue& value, std::vector<uint8_t>& out) {
+    out.clear();
+    try {
+        size_t num_objects = bplist_count_objects(value);
+        if (num_objects == 0) return false;
+
+        // ref_size 由总对象数决定（1/2/4 字节），全文件统一
+        int ref_size = (num_objects < 256) ? 1 : (num_objects < 65536) ? 2 : 4;
+
+        std::vector<uint8_t> body;
+        body.reserve(256);
+        std::vector<uint64_t> offsets;
+        offsets.reserve(num_objects);
+        uint64_t top_id = bplist_encode(value, body, offsets, ref_size);
+        if (top_id != 0) return false; // 顶层必须是第一个对象
+
+        // offset 表条目字节数由最大偏移（含 8 字节文件头）决定；
+        // 条目值 = 对象在文件中的绝对偏移（解析端按 data + obj_offset 读）。
+        const size_t kHeaderLen = 8;
+        size_t off_table_off = kHeaderLen + body.size();
+        int offset_size = (off_table_off < 256) ? 1
+                         : (off_table_off < 65536) ? 2 : 4;
+
+        std::vector<uint8_t> off_table;
+        off_table.reserve(offsets.size() * offset_size);
+        for (auto o : offsets) bplist_write_int(off_table, kHeaderLen + o, offset_size);
+
+        // 组装：header + body + offset 表 + trailer
+        out.reserve(kHeaderLen + body.size() + off_table.size() + 32);
+        const char kHeader[] = "bplist00";
+        out.insert(out.end(), kHeader, kHeader + kHeaderLen);
+        out.insert(out.end(), body.begin(), body.end());
+        out.insert(out.end(), off_table.begin(), off_table.end());
+
+        uint8_t trailer[32] = {0};
+        trailer[6] = (uint8_t)offset_size;
+        trailer[7] = (uint8_t)ref_size;
+        for (int i = 7; i >= 0; --i) trailer[8 + i] = (uint8_t)((num_objects >> (8 * (7 - i))) & 0xFF);
+        for (int i = 7; i >= 0; --i) trailer[16 + i] = (uint8_t)((top_id >> (8 * (7 - i))) & 0xFF);
+        for (int i = 7; i >= 0; --i) trailer[24 + i] = (uint8_t)((off_table_off >> (8 * (7 - i))) & 0xFF);
+        out.insert(out.end(), trailer, trailer + 32);
+        return true;
+    } catch (const std::exception&) {
+        out.clear();
+        return false;
+    }
 }
 
 } // namespace util

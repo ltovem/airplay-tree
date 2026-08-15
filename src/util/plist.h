@@ -188,18 +188,37 @@ bool parse_plist(const std::string& data, PlistValue& out);
 std::string serialize_xml_plist(const PlistValue& value);
 
 /*!
- * @brief Base64 解码（标准字母表 + '=' 填充，跳过换行/空格）
+ * @brief 序列化为 binary plist (bplist00)
+ *
+ * AirPlay 2 协议里多个 RTSP 响应要求 binary plist 格式（Content-Type:
+ * application/x-apple-binary-plist），例如 AP2 的 SETUP 响应
+ * （timingPort/eventPort/streams）。本函数把 PlistValue 树编码成
+ * 标准的 bplist00 字节流（不做对象去重，含完整 trailer）。
+ *
+ * 支持的类型：BOOL / INT / REAL / STRING / DATA / ARRAY / DICT；
+ * DATE 按 REAL 编码（解析端 date 为 Unix 秒，序列化时转回 Apple epoch）。
+ *
+ * @param value 要序列化的值
+ * @param[out] out 编码后的字节流；失败时清空
+ * @return true 编码成功
+ */
+bool serialize_binary_plist(const PlistValue& value, std::vector<uint8_t>& out);
+
+/*!
+ * @brief base64 解码（RFC 4648；自动跳过换行/空白字符）
+ *
  * @param in  输入 base64 文本
- * @param out 输出字节（清空后追加）
- * @return true 成功（忽略非法字符；纯非法输入返回 true 但 out 为空）
+ * @param out 解码结果
+ * @return true 表示解码成功
  */
 bool base64_decode(const std::string& in, std::vector<uint8_t>& out);
 
 /*!
- * @brief Base64 编码
+ * @brief base64 编码（RFC 4648，无换行）
+ *
  * @param data 输入字节
- * @param len  字节数
- * @return base64 字符串（标准 RFC 4648，无换行）
+ * @param len  输入长度
+ * @return base64 字符串
  */
 std::string base64_encode(const uint8_t* data, size_t len);
 

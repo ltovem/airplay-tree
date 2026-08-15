@@ -29,6 +29,7 @@
 #include "../platform/platform_socket.h"
 #include "../platform/platform_thread.h"
 #include "../crypto/aes_ctr.h"
+#include "../crypto/aes_cbc.h"
 #include "rtcp.h"
 #include "timing.h"
 #include <cstdint>
@@ -117,6 +118,18 @@ public:
                                const std::string& aes_iv_hex);
 
     /*!
+     * @brief 设置 AES-128-CBC 解密参数（AirPlay 2 SETUP bplist 的 ekey/eiv）
+     *
+     * AP2 音频 RTP：12 字节 RTP 头明文，payload 从第 0 字节起 AES-CBC
+     * 加密，IV = SETUP bplist 的 eiv（固定，非每包随机）。解密在
+     * receiver 线程按包进行（每包重新 init IV，因为 CBC 每包独立）。
+     *
+     * @param key 16 字节 AES 密钥（已含 ecdh_secret 哈希）
+     * @param iv  16 字节 IV（SETUP bplist 的 eiv）
+     */
+    void set_cbc_decryption(const uint8_t* key, const uint8_t* iv);
+
+    /*!
      * @brief 告诉 RtpReceiver 发送端的 UDP 地址，用于回 RR / timing response
      *
      * SETUP 请求里 Transport header 带 client_port=X-Y，
@@ -197,7 +210,10 @@ private:
     // ---- 协议处理子模块（都只在 worker 线程使用，无锁）------------------------
     RtcpHandler          rtcp_;        ///< 解析 SR + 构造 RR
     TimingHandler        timing_;      ///< 解析 timing request + 构造 response
-    crypto::AesCtr       aes_;         ///< AES-128-CTR 解密（逐包 process）
+    crypto::AesCtr       aes_;         ///< AES-128-CTR 解密（逐包 process，AP1 SDP 路径）
+    crypto::AesCbc      cbc_;          ///< AES-128-CBC 解密（AP2 SETUP ekey/eiv 路径）
+    uint8_t             cbc_iv_[16];   ///< CBC IV（SETUP bplist 的 eiv）
+    bool                cbc_ready_ = false; ///< 是否启用 CBC 解密
     // RTP jitter 估算（RFC 3550 A.8）：给 RR 里的 jitter 字段，
     // 不用很精确，AirPlay 发送端只用它做大致拥塞判断。
     uint32_t             jitter_est_ = 0;

@@ -68,6 +68,12 @@ set(AIRPLAY2_SOURCES
     src/crypto/aes_cbc.cpp
     src/crypto/sha512.cpp
     src/crypto/curve25519.cpp
+    src/crypto/fairplay_sap.cpp
+    # PlayFair 白盒 AES（Apple FairPlay 密钥材料，C 编译）
+    src/crypto/playfair/omg_hax.c
+    src/crypto/playfair/hand_garble.c
+    src/crypto/playfair/modified_md5.c
+    src/crypto/playfair/sap_hash.c
     src/util/plist.cpp
     src/core/airplay_server_impl.cpp
     src/core/airplay_session_impl.cpp

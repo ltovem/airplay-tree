@@ -35,6 +35,12 @@ bool VideoRtpReceiver::set_decryption_params(const std::string& aes_key_hex,
     return aes_->ctr.set_key(kb.data(), ivb.data());
 }
 
+bool VideoRtpReceiver::set_decryption_key(const uint8_t key[16], const uint8_t iv[16]) {
+    if (!key || !iv) return false;
+    if (!aes_) aes_ = std::make_unique<AesCtx>();
+    return aes_->ctr.set_key(key, iv);
+}
+
 bool VideoRtpReceiver::open(uint16_t data_port_min, uint16_t data_port_max,
                             uint16_t& out_data_port) {
     using platform::SocketProtocol;
