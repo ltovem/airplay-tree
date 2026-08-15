@@ -130,6 +130,21 @@ bool MdnsPublisher::start(const DeviceInfo& device, const std::string& if_ipv4) 
     }
     hostname_.append(".local");
 
+#if AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS
+    // Apple 平台优先走系统 Bonjour：注册直接进 mDNSResponder，
+    // iPhone/Apple TV 一定能发现，无需自己打组播包
+    if (register_with_bonjour()) {
+        bonjour_mode_ = true;
+        running_.store(true);
+        announce_count_ = 0;
+        announce_timer_us_ = 0;
+        worker_.start([this] { mdns_worker(); }, "ap2-mdns");
+        return true;
+    }
+    bonjour_mode_ = false;
+    AP2_LOGW("mdns: Bonjour register failed, falling back to UDP multicast");
+#endif
+
     if (!sock4_.create(platform::SocketProtocol::UDP, false)) {
         AP2_LOGE("mdns: create UDP socket failed");
         return false;
@@ -164,9 +179,25 @@ bool MdnsPublisher::start(const DeviceInfo& device, const std::string& if_ipv4) 
             AP2_LOGW("mdns: join multicast failed");
         }
 #endif
-    }
+    } // 结束 join multicast group 作用域
     sock4_.set_option(platform::SOCK_OPT_MULTICAST_TTL, 255);
-    sock4_.set_option(platform::SOCK_OPT_MULTICAST_LOOP, 0);
+    // 显式指定组播发送接口，避免 macOS 多网卡（Wi-Fi/VPN）时选错出口
+    {
+#if AP2_PLATFORM_WINDOWS
+        struct in_addr local_if{};
+        local_if.s_addr = inet_addr(adv_ip_.c_str());
+        setsockopt((SOCKET)sock4_.handle(), IPPROTO_IP, IP_MULTICAST_IF,
+                   (const char*)&local_if, sizeof(local_if));
+#else
+        struct in_addr local_if{};
+        inet_pton(AF_INET, adv_ip_.c_str(), &local_if);
+        setsockopt((int)sock4_.handle(), IPPROTO_IP, IP_MULTICAST_IF,
+                   &local_if, sizeof(local_if));
+#endif
+    }
+    // 打开组播回环：让同机其他 mDNS 客户端（如 Bonjour 浏览器、本机其他 App）
+    // 也能发现本服务；对跨设备（iPhone 等）无影响
+    sock4_.set_option(platform::SOCK_OPT_MULTICAST_LOOP, 1);
 
     running_.store(true);
     announce_count_ = 0;
@@ -176,6 +207,17 @@ bool MdnsPublisher::start(const DeviceInfo& device, const std::string& if_ipv4) 
 }
 
 void MdnsPublisher::stop() {
+#if AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS
+    if (bonjour_mode_) {
+        // Bonjour 模式：停 worker 后释放注册句柄（mDNSResponder 自动撤下记录）
+        running_.store(false);
+        worker_.stop_and_join();
+        if (airplay_ref_) { DNSServiceRefDeallocate(airplay_ref_); airplay_ref_ = nullptr; }
+        if (raop_ref_)    { DNSServiceRefDeallocate(raop_ref_);    raop_ref_    = nullptr; }
+        bonjour_mode_ = false;
+        return;
+    }
+#endif
     if (running_.exchange(false)) {
         // Send a goodbye announcement if possible
         try { send_announcements(true); } catch (...) {}
@@ -192,16 +234,16 @@ std::vector<uint8_t> MdnsPublisher::build_service_record(
     std::vector<uint8_t> pkt;
     pkt.reserve(512);
 
-    // DNS header: id=0, flags=0x8400 (response authoritative), 1 question, N answers, 0 NS, 1 additional
+    // DNS header: id=0, flags=0x8400 (response authoritative), 0 questions,
+    // N answers, 0 NS, 0 additional. 注意：mDNS 主动宣告（unsolicited response）
+    // 不带 question 段，且 RFC 6762 禁止在 question 里置 cache-flush 位；
+    // 之前放一个 QCLASS=0x8001 的 question 会导致部分 mDNS 实现丢弃整包。
     uint16_t answers = 0;
     size_t hdr_off = pkt.size();
     pkt.resize(12, 0); // header placeholder
 
-    // Question section (1)
+    // 服务实例完整名称：inst.type.domain（用于 PTR/SRV/TXT 记录的 owner 名字）
     std::string qname = inst_name + "." + type + "." + domain;
-    append_name(pkt, qname);
-    append_u16(pkt, 255); // QTYPE = ANY
-    append_u16(pkt, 0x8001); // QCLASS = IN + cache-flush
 
     // We will produce: PTR, SRV, TXT, A
     const uint16_t CLASS_FLUSH = 0x8001;
@@ -210,6 +252,7 @@ std::vector<uint8_t> MdnsPublisher::build_service_record(
     size_t answers_off = pkt.size();
 
     // --- PTR: type.domain -> inst.type.domain ---
+    // PTR 记录在 mDNS 中不可 flush（同一名字可有多个值），class 用 0x0001
     std::string ptr_name = type + "." + domain;
     append_name(pkt, ptr_name);
     append_u16(pkt, 12);    // TYPE PTR
@@ -282,8 +325,8 @@ std::vector<uint8_t> MdnsPublisher::build_service_record(
     pkt[hdr_off + 0] = 0; pkt[hdr_off + 1] = 0; // txn id
     // flags = 0x8400
     pkt[hdr_off + 2] = 0x84; pkt[hdr_off + 3] = 0x00;
-    // QDCOUNT = 1
-    pkt[hdr_off + 4] = 0; pkt[hdr_off + 5] = 1;
+    // QDCOUNT = 0（宣告不带 question）
+    pkt[hdr_off + 4] = 0; pkt[hdr_off + 5] = 0;
     // ANCOUNT
     pkt[hdr_off + 6] = (uint8_t)(answers >> 8);
     pkt[hdr_off + 7] = (uint8_t)answers;
@@ -394,7 +437,111 @@ void MdnsPublisher::handle_query(const uint8_t* pkt, size_t len, const platform:
     }
 }
 
+#if AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS
+std::vector<uint8_t> MdnsPublisher::build_txt_blob(
+    const std::map<std::string, std::string>& txt) {
+    // DNS-SD TXT 记录负载：每一项 = 1 字节长度 + 内容（key=value）
+    std::vector<uint8_t> out;
+    for (const auto& kv : txt) {
+        std::string s = kv.first;
+        if (!kv.second.empty()) { s += "="; s += kv.second; }
+        if (s.size() > 255) s.resize(255);
+        out.push_back((uint8_t)s.size());
+        out.insert(out.end(), s.begin(), s.end());
+    }
+    if (out.empty()) out.push_back(0); // 空 TXT 也必须有至少一个 0 长度项
+    return out;
+}
+
+bool MdnsPublisher::register_with_bonjour() {
+    // TXT 内容与 UDP 路径 send_announcements() 保持一致，
+    // 保证不同后端宣告出去的设备能力完全相同
+    std::map<std::string, std::string> txt;
+    std::string model = device_.model;
+    if (model.empty()) model = device_.supports_video ? "AppleTV6,2" : "AudioAccessory1,2";
+    txt["deviceid"] = device_.device_id;
+    txt["features"] = format_features(device_.features);
+    txt["model"]    = model;
+    txt["srcvers"]  = "605.30.1";
+    txt["vv"]       = device_.supports_video ? "2" : "1";
+    txt["vn"]       = "65537";
+    txt["os"]       = "13.4.1";
+    txt["pk"]       = "";
+    txt["pi"]       = device_.device_id;
+    if (device_.supports_video) {
+        txt["tvOSVersion"] = "13.4.1";
+        txt["acl"]         = "0";
+        txt["atm"]         = "RXVhQ2FzdGU=";
+        txt["cvs"]         = "1";
+    }
+    if (!device_.requires_encryption) txt["sf"] = "0x80000"; // no password required
+    else                              txt["sf"] = "0x0";
+    auto blob = build_txt_blob(txt);
+
+    // host=NULL：让 mDNSResponder 用本机主机名作为 SRV target，A 记录自动解析
+    DNSServiceErrorType err = DNSServiceRegister(
+        &airplay_ref_, 0, 0, device_.name.c_str(),
+        "_airplay._tcp", "local.", nullptr, htons(device_.port),
+        (uint16_t)blob.size(), blob.data(), nullptr, nullptr);
+    if (err != kDNSServiceErr_NoError) {
+        AP2_LOGW("mdns: DNSServiceRegister(_airplay) failed err=%d", (int)err);
+        airplay_ref_ = nullptr;
+        return false;
+    }
+    AP2_LOGI("mdns: registered _airplay._tcp '%s' port %u via Bonjour",
+             device_.name.c_str(), (unsigned)device_.port);
+
+    // _raop._tcp 兼容注册（旧式音频投送），失败不致命
+    std::string devid = device_.device_id;
+    for (auto it = devid.begin(); it != devid.end(); ) {
+        if (*it == ':') it = devid.erase(it);
+        else ++it;
+    }
+    std::map<std::string, std::string> rtxt;
+    rtxt["cn"] = "0,1,2,3";
+    rtxt["da"] = "true";
+    rtxt["et"] = "0,3,5";
+    rtxt["vv"] = "2";
+    rtxt["vn"] = "65537";
+    rtxt["tp"] = "UDP";
+    rtxt["sm"] = "false";
+    rtxt["ek"] = "1";
+    rtxt["rn"] = "0";
+    rtxt["md"] = "0,1,2";
+    rtxt["pw"] = device_.requires_encryption ? "true" : "false";
+    rtxt["sr"] = "44100";
+    rtxt["ss"] = "16";
+    rtxt["ch"] = "2";
+    auto rblob = build_txt_blob(rtxt);
+    err = DNSServiceRegister(
+        &raop_ref_, 0, 0, (devid + "@" + device_.name).c_str(),
+        "_raop._tcp", "local.", nullptr, htons(device_.port),
+        (uint16_t)rblob.size(), rblob.data(), nullptr, nullptr);
+    if (err != kDNSServiceErr_NoError) {
+        AP2_LOGW("mdns: DNSServiceRegister(_raop) failed err=%d (non-fatal)", (int)err);
+        raop_ref_ = nullptr;
+    } else {
+        AP2_LOGI("mdns: registered _raop._tcp via Bonjour");
+    }
+    return true;
+}
+#endif // AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS
+
 void MdnsPublisher::mdns_worker() {
+#if AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS
+    if (bonjour_mode_) {
+        // Bonjour 模式：注册由系统 mDNSResponder 负责宣告/续期，
+        // worker 只泵送事件，保证句柄活跃并处理名字冲突
+        AP2_LOGI("mdns: Bonjour publishing (ip=%s airplay_port=%u)",
+                 adv_ip_.c_str(), device_.port);
+        while (running_.load()) {
+            if (airplay_ref_) DNSServiceProcessResult(airplay_ref_);
+            if (raop_ref_)    DNSServiceProcessResult(raop_ref_);
+            platform::sleep_ms(100);
+        }
+        return;
+    }
+#endif
     AP2_LOGI("mdns: advertising services (ip=%s airplay_port=%u)", adv_ip_.c_str(), device_.port);
     uint8_t buf[2048];
     const uint64_t ANNOUNCE_INTERVAL_US = 1500000ULL; // 1.5s between first few

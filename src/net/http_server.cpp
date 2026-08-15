@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cctype>     // std::tolower（HTTP header 名大小写不敏感比较）
+#include <exception>  // std::exception（连接处理线程的兜底捕获）
 
 namespace airplay2 {
 namespace net {
@@ -151,6 +152,9 @@ void HttpServer::accept_worker() {
         std::weak_ptr<Connection> wconn = conn;
         HttpServer* self = this;
         t->start([self, wconn, t] {
+            // 必须先 detach 再 delete：线程在自己体内析构 Thread 对象时，
+            // 析构函数会 join() 自身线程 → self-join 异常 → 进程崩溃
+            t->detach();
             if (auto c = wconn.lock()) self->connection_worker(c);
             delete t;
         }, "ap2-http-conn");
@@ -160,6 +164,9 @@ void HttpServer::accept_worker() {
 void HttpServer::connection_worker(std::shared_ptr<Connection> conn) {
     uint8_t buf[8192];
     bool closed = false;
+    // 整个连接处理包一层 try/catch：客户端可发送任意畸形数据，
+    // 任何解析异常都不允许逃出线程（否则 libc++abi: terminating 直接崩进程）
+    try {
     while (running_.load() && !closed) {
         std::vector<platform::Socket*> socks = { &conn->socket() };
         std::vector<size_t> ready;
@@ -198,6 +205,14 @@ void HttpServer::connection_worker(std::shared_ptr<Connection> conn) {
         connections_.erase(conn->id());
     }
     AP2_LOGI("http: connection %lu closed", (unsigned long)conn->id());
+    } catch (const std::exception& e) {
+        // 记录异常来源，避免客户端输入导致进程崩溃
+        AP2_LOGE("http: connection %lu handler exception: %s",
+                 (unsigned long)conn->id(), e.what());
+    } catch (...) {
+        AP2_LOGE("http: connection %lu handler unknown exception",
+                 (unsigned long)conn->id());
+    }
 }
 
 } // namespace net

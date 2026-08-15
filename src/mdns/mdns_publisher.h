@@ -35,6 +35,13 @@
 #include <vector>
 #include <memory>
 
+// Apple 平台（macOS/iOS）原生使用 Bonjour（DNSServiceRegister）发布，
+// 直接把服务注册进系统 mDNSResponder，保证 iPhone 等发送端一定能发现；
+// 其他平台（Linux/Windows/Android）继续走下面的自建 UDP 组播响应器。
+#if AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS
+    #include <dns_sd.h>
+#endif
+
 namespace airplay2 {
 
 /*!
@@ -70,6 +77,16 @@ public:
     bool is_running() const { return running_.load(); }
 
 private:
+#if AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS
+    // Apple 平台：用系统 Bonjour 注册 _airplay / _raop 服务。
+    // 成功返回 true 且 airplay_ref_/raop_ref_ 非空；两个都失败返回 false
+    // （调用方随后回退到 UDP 组播路径）。TXT 记录内容与 UDP 路径保持一致。
+    bool register_with_bonjour();
+    // 把 key=value map 编码成 mDNS TXT 记录负载（每项 1 字节长度前缀）。
+    static std::vector<uint8_t> build_txt_blob(
+        const std::map<std::string, std::string>& txt);
+#endif
+
     // ---- worker 线程主循环 ---------------------------------------------------
     //   select(sock4_, 100ms timeout) 同时承担"收查询"和"定时 announce"
     //   的驱动，避免单独搞 timerfd 带来跨平台负担
@@ -106,6 +123,15 @@ private:
 
     platform::Thread worker_;              ///< worker 线程对象（pthread / std::thread 抽象）
     platform::Socket sock4_;               ///< IPv4 UDP socket，加入 224.0.0.251，SO_REUSEADDR
+
+#if AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS
+    // Bonjour 模式下的两个服务注册句柄（_airplay / _raop）。
+    // bonjour_mode_ 为 true 时 worker 只做 DNSServiceProcessResult 泵送，
+    // 不碰 sock4_（UDP socket 此时不创建）。
+    DNSServiceRef airplay_ref_ = nullptr;
+    DNSServiceRef raop_ref_    = nullptr;
+    bool          bonjour_mode_ = false;
+#endif
 
     DeviceInfo device_;                    ///< 深拷贝自 start() 传入的 DeviceInfo
     std::string adv_ip_;                   ///< 实际宣告的本机 IPv4（A record 里带的）
