@@ -748,20 +748,7 @@ void ed25519_sign(const uint8_t sk[kEd25519KeySize],
     uint8_t sbuf[64]; std::memset(sbuf, 0, 64);
     // 256x256 → 512 位乘法：hram * sk
     uint8_t a_bytes[32]; std::memcpy(a_bytes, sk, 32);
-    // 手写 grade-school multiply into uint64_t[8]
-    uint64_t p[8] = {0};
-    for (int i = 0; i < 32; ++i) {
-        uint64_t carry = 0;
-        for (int j = 0; j < 32; ++j) {
-            int idx = (i + j) / 8;
-            int off = ((i + j) % 8) * 8;
-            __uint128_t prod = (__uint128_t)hram[i] * (__uint128_t)a_bytes[j];
-            p[idx] += (uint64_t)(prod << off) + carry;
-            carry = (uint64_t)((prod >> (64 - off)) + (p[idx] < (carry + (uint64_t)(prod << off)) ? 1ULL : 0ULL));
-            // 更稳：另一个 9th 元素存溢出
-        }
-    }
-    // 简化：上面乘法易出错，改用 bytes 版本 sc_muladd：直接做"加 r"然后 reduce
+    // 简化：用逐字节 grade-school 乘法做 256x256 → 512-bit (hram * sk)，再 reduce
     // 我们先把 sbuf 填成 r（rbuf 前 32 字节，后 32 字节为 0，已经 reduce 过）
     std::memset(sbuf, 0, 64);
     std::memcpy(sbuf, rbuf, 32);
