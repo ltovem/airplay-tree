@@ -29,6 +29,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <memory>
 
 namespace airplay2 {
 namespace codec {

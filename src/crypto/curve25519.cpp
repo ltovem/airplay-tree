@@ -13,9 +13,43 @@
 #include "curve25519.h"
 #include "sha512.h"
 #include <cstring>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace airplay2 {
 namespace crypto {
+
+/*!
+ * @brief 可移植 64×64 → 128 位乘法
+ *
+ * MSVC 不支持 __int128；32 位 ARM 也不支持。
+ * 本函数在三个路径中选一个：
+ *   - MSVC x64/ARM64: 用 _umul128 内建
+ *   - GCC/Clang 64 位: 用 __uint128_t
+ *   - 其它（32 位）: 拆成 32×32 四次乘法手拼
+ */
+static inline void mul64x64(uint64_t a, uint64_t b, uint64_t& lo, uint64_t& hi) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+    lo = _umul128(a, b, &hi);
+#elif defined(__SIZEOF_INT128__) || defined(__int128)
+    __uint128_t r = (__uint128_t)a * b;
+    lo = (uint64_t)r;
+    hi = (uint64_t)(r >> 64);
+#else
+    uint64_t a_lo = (uint32_t)a;
+    uint64_t a_hi = a >> 32;
+    uint64_t b_lo = (uint32_t)b;
+    uint64_t b_hi = b >> 32;
+    uint64_t ll = a_lo * b_lo;
+    uint64_t lh = a_lo * b_hi;
+    uint64_t hl = a_hi * b_lo;
+    uint64_t hh = a_hi * b_hi;
+    uint64_t mid = (ll >> 32) + (lh & 0xFFFFFFFFULL) + (hl & 0xFFFFFFFFULL);
+    lo = (ll & 0xFFFFFFFFULL) | (mid << 32);
+    hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+#endif
+}
 
 /* ---- GF(2^255-19) 域：5 个 51 位 limb ----
  * p = 2^255 - 19
@@ -71,23 +105,38 @@ static void fe_sub2(fe o, const fe a, const fe b) {
     }
 }
 static void fe_mul(fe o, const fe a, const fe b) {
-    // 128 位中间乘法
-    __int128 t[10] = {0};
+    // 用 uint64_t lo/hi 对替代 __int128，兼容 MSVC 和 32 位 ARM
+    uint64_t t_lo[10] = {0}, t_hi[10] = {0};
     for (int i = 0; i < 5; ++i) {
         for (int j = 0; j < 5; ++j) {
-            t[i+j] += (__int128)a[i] * (__int128)b[j];
+            uint64_t lo, hi;
+            mul64x64((uint64_t)a[i], (uint64_t)b[j], lo, hi);
+            uint64_t nl = t_lo[i+j] + lo;
+            if (nl < t_lo[i+j]) t_hi[i+j] += 1;
+            t_lo[i+j] = nl;
+            t_hi[i+j] += hi;
         }
     }
     // 合并：t[5..9] 对应 *2^255 ≡ *19
     for (int i = 0; i < 5; ++i) {
-        t[i] += 19 * (__int128)t[i + 5];
+        uint64_t m_lo = 19 * t_lo[i + 5];
+        uint64_t m_hi = 19 * t_hi[i + 5];
+        uint64_t nl = t_lo[i] + m_lo;
+        if (nl < t_lo[i]) m_hi += 1;
+        t_lo[i] = nl;
+        t_hi[i] += m_hi;
     }
     // 拆分每 limb 然后进位（每 limb 最多 51 bit 有效位）
     for (int i = 0; i < 5; ++i) {
-        int64_t c = (int64_t)(t[i] >> 51);
-        o[i] = (int64_t)(t[i] & (__int128)kLimbMask);
-        if (i < 4) o[i+1] += c;
-        else       o[0]  += c * 19;
+        o[i] = (int64_t)(t_lo[i] & (uint64_t)kLimbMask);
+        // carry = (t_lo >> 51) | (t_hi << 13)
+        uint64_t c = (t_lo[i] >> 51) | (t_hi[i] << 13);
+        if (i < 4) {
+            t_lo[i+1] += c;
+            if (t_lo[i+1] < c) t_hi[i+1] += 1;
+        } else {
+            o[0] += (int64_t)c * 19;
+        }
     }
     fe_carry(o);
     fe_carry(o);
@@ -542,9 +591,13 @@ static void sc_reduce(uint8_t r[64]) {
             // num -= L * 2^(shift*64) by subtraction with borrow
             uint64_t borrow = 0;
             for (int j = 0; j < 4; ++j) {
-                __uint128_t s = (__uint128_t)num[shift+j] - Lw[j] - borrow;
-                num[shift+j] = (uint64_t)s;
-                borrow = (uint64_t)(s >> 127);
+                uint64_t a_val = num[shift+j];
+                uint64_t s = a_val - Lw[j];
+                uint64_t b1 = (a_val < Lw[j]) ? 1 : 0;
+                uint64_t s2 = s - borrow;
+                uint64_t b2 = (s < borrow) ? 1 : 0;
+                num[shift+j] = s2;
+                borrow = b1 | b2;
             }
             shift = 5; // 重置再来
         }
@@ -559,9 +612,13 @@ static void sc_reduce(uint8_t r[64]) {
         if (cmp < 0) break;
         uint64_t borrow = 0;
         for (int j = 0; j < 4; ++j) {
-            __uint128_t s = (__uint128_t)num[j] - Lw[j] - borrow;
-            num[j] = (uint64_t)s;
-            borrow = (uint64_t)(s >> 127);
+            uint64_t a_val = num[j];
+            uint64_t s = a_val - Lw[j];
+            uint64_t b1 = (a_val < Lw[j]) ? 1 : 0;
+            uint64_t s2 = s - borrow;
+            uint64_t b2 = (s < borrow) ? 1 : 0;
+            num[j] = s2;
+            borrow = b1 | b2;
         }
     }
     for (int i = 0; i < 8; ++i) {
