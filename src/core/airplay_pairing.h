@@ -13,6 +13,7 @@
 #define AIRPLAY2_AIRPLAY_PAIRING_H
 
 #include <cstdint>
+#include <functional>   // std::function（PinCb 回调类型）
 #include <map>
 #include <mutex>
 #include <string>
