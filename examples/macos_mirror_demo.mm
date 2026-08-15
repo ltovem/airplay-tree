@@ -186,7 +186,7 @@ public:
         dispatch_sync(q_, ^{
             if (fmt_desc_) { CFRelease(fmt_desc_); fmt_desc_ = nullptr; }
         });
-        if (q_) dispatch_release(q_);
+        // ARC 模式下 dispatch 对象自动释放，无需 dispatch_release
     }
 
     void attach(AVSampleBufferDisplayLayer* layer) { layer_ = layer; }
