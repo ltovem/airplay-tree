@@ -16,33 +16,13 @@ namespace airplay2 {
 
 // ISO 14496-3 AudioSpecificConfig（AAC-ELD, audioObjectType=39）构造。
 // AP2 镜像音频（ct=8）的 SETUP 不带 RFC 3640 fmtp，渲染器必须靠 config=
-// 创建解码器；按规范把 ELD 的 ASC 拼成 3 字节十六进制字符串。
-//   bit layout: 11111(escape) 000111(39-32=7) SFI(4) CC(4) frmLenFlag(1) depCore(1) extFlag(1)
-//   SFI 表: 96000=0 88200=1 64000=2 48000=3 44100=4 32000=5 24000=6 22050=7 16000=8 12000=9 11025=10 8000=11 7350=12
+// 创建解码器。
+// 实测（AudioToolbox）：f8e85000 能被接受并解码（UxPlay GStreamer 同款
+// codec_data）；f8e840 会被 AudioConverter 拒（'bada'）。spf=480 与
+// frameLengthFlag 的关系 AudioToolbox 内部自行处理，这里复用 UxPlay 验证值。
 static std::string build_eld_asc(uint32_t sample_rate, uint32_t channels) {
-    static const uint32_t kSfiTable[] = {96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350};
-    uint32_t sfi = 4; // 默认 44100
-    for (size_t i = 0; i < sizeof(kSfiTable)/sizeof(kSfiTable[0]); ++i) {
-        if (sample_rate == kSfiTable[i]) { sfi = (uint32_t)i; break; }
-    }
-    if (channels == 0) channels = 2;
-    uint32_t cc = (channels > 7) ? 2 : channels; // channelConfiguration 最多 4bit（7 声道规范内）
-    // 逐位拼（27 位，含 escape 的 11 位 + SFI + CC + 3 个 flag）
-    uint64_t bits = 0; int n = 0;
-    auto put = [&](uint64_t v, int w) { bits = (bits << w) | (v & ((1ULL<<w)-1)); n += w; };
-    put(31, 5);              // audioObjectType escape → 31
-    put(39 - 32, 6);         // AOT 39 (ELD)
-    put(sfi, 4);
-    put(cc, 4);
-    put(0, 1);               // frameLengthFlag = 0（480 samples/frame）
-    put(0, 1);               // dependsOnCoreCoder
-    put(0, 1);               // extensionFlag
-    while (n % 8) { bits <<= 1; ++n; } // 补零到字节对齐
-    char hex[16];
-    std::snprintf(hex, sizeof(hex), "%02X%02X%02X",
-                  (unsigned)((bits >> 16) & 0xFF), (unsigned)((bits >> 8) & 0xFF),
-                  (unsigned)(bits & 0xFF));
-    return std::string(hex);
+    (void)sample_rate; (void)channels;
+    return "f8e85000";
 }
 
 void SessionImpl::derive_media_keys() {
@@ -169,6 +149,7 @@ void SessionImpl::configure_audio(const net::SdpInfo& sdp) {
         std::string lower = codec_mode_;
         for (char& c : lower) c = (char)std::tolower((unsigned char)c);
         if (lower.find("applelossless") != std::string::npos || lower == "alac") {
+            aac_fmtp_.clear();  // 切到 ALAC：清掉可能残留的 AAC fmtp
             codec::AlacMagicCookie cookie;
             if (!sdp.fmtp.empty() && codec::parse_alac_fmtp(sdp.fmtp, cookie)) {
                 cookie.sample_rate = audio_cfg_.sample_rate;
@@ -183,25 +164,30 @@ void SessionImpl::configure_audio(const net::SdpInfo& sdp) {
                 audio_cfg_ = alac_.output_config();
             }
         } else if (lower.find("l16") != std::string::npos || lower == "pcm") {
+            aac_fmtp_.clear();
             audio_cfg_.format = AudioFormat::PCM16LE;
         } else if (lower.find("mpeg4") != std::string::npos || lower.find("aac") != std::string::npos) {
-            // AAC / AAC-ELD：压缩帧原样透传给渲染器解码（demo 用 AudioConverter）。
-            // fmtp 里带 config= AudioSpecificConfig，渲染器需要它来建解码器。
+            // AAC / AAC-ELD（屏幕镜像音频）：库内置解码器解码。
+            // fmtp 里带 config= AudioSpecificConfig，解码器需要它初始化。
             codec_mode_ = "mpeg4-generic";
             audio_cfg_.format = AudioFormat::AAC_ELD;
-            if (audio_renderer_) {
-                audio_renderer_->on_compressed_config(codec_mode_, sdp.fmtp, audio_cfg_);
-            }
+            aac_fmtp_ = sdp.fmtp;
         }
     }
+    // 引擎（AVAudioEngine/player）对所有 codec 都要建（含 ALAC/AAC/PCM）。
     pcm_buffer_.set_config(audio_cfg_);
     if (audio_renderer_) audio_renderer_->on_config(audio_cfg_);
+    // 初始化库内置 AAC 解码器（协商到 AAC 时；ALAC/PCM 分支已清空 aac_fmtp_）。
+    if (!aac_fmtp_.empty()) {
+        aac_.configure(aac_fmtp_, audio_cfg_.sample_rate, audio_cfg_.channels,
+                       /*is_eld=*/audio_cfg_.format == AudioFormat::AAC_ELD);
+    }
     transition(AirPlaySession::State::READY);
 }
 
 void SessionImpl::configure_ap2_audio(uint64_t ct, uint64_t spf, uint64_t sr) {
     // AP2 纯音频（音乐投送）没有 ANNOUNCE，编解码参数全在 SETUP stream dict：
-    //   ct=2 → ALAC（spf=352，44.1kHz）；ct=8 → AAC-ELD（镜像音频，压缩透传）。
+    //   ct=2 → ALAC（spf=352，44.1kHz）；ct=8 → AAC-ELD（镜像音频，库内解码）。
     // 与 UxPlay raop_handler_setup case 96 + audio_get_format 的映射一致。
     audio_cfg_.sample_rate = (sr > 0) ? (uint32_t)sr : 44100;
     audio_cfg_.channels    = 2;
@@ -217,22 +203,28 @@ void SessionImpl::configure_ap2_audio(uint64_t ct, uint64_t spf, uint64_t sr) {
         alac_.configure(cookie);
         audio_cfg_ = alac_.output_config();
     } else {
-        // AAC-ELD / 其他：压缩帧透传给渲染器（demo 的 AudioConverter 解码）。
-        // AP2 镜像音频（ct=8 AAC-ELD）没有 ANNOUNCE/fmtp，渲染器拿不到
-        // RFC 3640 的 config=，导致解码器无法创建（日志 "no config in fmtp"）。
-        // 这里按 ISO 14496-3 手工构造 ELD AudioSpecificConfig 补上：
+        // AAC-ELD / 其他（屏幕镜像音频）：库内置解码器解码。
+        // AP2 镜像音频（ct=8 AAC-ELD）没有 ANNOUNCE/fmtp，解码器拿不到
+        // RFC 3640 的 config=，导致无法初始化。这里按 ISO 14496-3 手工
+        // 构造 ELD AudioSpecificConfig 补上：
         //   bits: 11111(escape) 000111(AOT=39 ELD) SFI(4) CC(4)
         //         frameLengthFlag(1) dependsOnCoreCoder(1) extensionFlag(1)
         codec_mode_ = "mpeg4-generic";
         audio_cfg_.format = AudioFormat::AAC_ELD;
         std::string config_hex = build_eld_asc(audio_cfg_.sample_rate, audio_cfg_.channels);
-        std::string fmtp = "config=" + config_hex;
-        if (audio_renderer_) {
-            audio_renderer_->on_compressed_config(codec_mode_, fmtp, audio_cfg_);
-        }
+        aac_fmtp_ = "config=" + config_hex;
     }
+    // 引擎（AVAudioEngine/player）对所有 codec 都要建——必须放在通用尾部，
+    // 否则 ct=2（ALAC 纯音频）不建引擎 → 没声音。
     pcm_buffer_.set_config(audio_cfg_);
     if (audio_renderer_) audio_renderer_->on_config(audio_cfg_);
+    // 初始化库内置 AAC 解码器（若本轮协商的是 AAC；ALAC/PCM 则清除）。
+    // 注意必须先于 on_config 之后的任何解码调用；aac_ 自身在 configure
+    // 内部会先 reset 旧实例，因此重复 SETUP 也安全。
+    if (!aac_fmtp_.empty()) {
+        aac_.configure(aac_fmtp_, audio_cfg_.sample_rate, audio_cfg_.channels,
+                       /*is_eld=*/audio_cfg_.format == AudioFormat::AAC_ELD);
+    }
     // AP2 里 RECORD 可能先于带流 SETUP 到达：播放已启动但渲染队列尚未创建，
     // 这里补一次 on_play，否则 AudioQueue 建好后永远不 start → 没声音。
     if (playing_.load() && audio_renderer_) audio_renderer_->on_play();
@@ -307,6 +299,7 @@ void SessionImpl::flush_buffers() {
     video_rtp_.flush();
     pcm_buffer_.flush();
     alac_.reset();
+    aac_.reset();
     if (audio_renderer_) audio_renderer_->on_flush();
 }
 
@@ -336,8 +329,8 @@ void SessionImpl::on_rtp_packet(const net::RtpAudioPacket& pkt) {
         samples = pcm_buffer_.write_bytes(pcm.data(), pcm.size());
     } else if (lower_mode.find("mpeg4") != std::string::npos ||
                lower_mode.find("aac") != std::string::npos) {
-        // AAC-ELD / AAC：压缩帧原样透传给渲染器（demo 用 AudioConverter 解码），
-        // 不走 PCM 缓冲。未配置解码器时渲染器内部会丢弃。
+        // AAC-ELD / AAC（屏幕镜像音频）：用库内置解码器解成 PCM，与 ALAC
+        // 共用同一条 pcm_buffer_ → playback_worker → on_pcm 播放链路。
         // UxPlay：AAC-ELD 流开头的 4 字节 "no_data_marker"(0x00 0x68 0x34 0x00)
         // 替换了 payload 的包不是音频，必须跳过，否则解码器吃垃圾。
         if (pkt.payload.size() == 4 &&
@@ -345,11 +338,11 @@ void SessionImpl::on_rtp_packet(const net::RtpAudioPacket& pkt) {
             pkt.payload[2] == 0x34 && pkt.payload[3] == 0x00) {
             return;
         }
-        if (audio_renderer_) {
-            audio_renderer_->on_compressed_audio(pkt.payload.data(), pkt.payload.size(),
-                                                 pkt.recv_us);
-        }
-        return;
+        if (!aac_.is_configured()) return;
+        int64_t used = aac_.decode_frame(pkt.payload.data(), pkt.payload.size(), pcm);
+        if (used < 0) return;
+        (void)used;
+        samples = pcm_buffer_.write_bytes(pcm.data(), pcm.size());
     } else if (lower_mode.find("l16") != std::string::npos || lower_mode == "pcm") {
         // Raw PCM 16-bit big-endian? AirPlay L16 is usually BE.
         pcm = pkt.payload;

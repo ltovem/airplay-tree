@@ -11,6 +11,7 @@
 #include "../net/rtsp_server.h"
 #include "../net/video_rtp.h"
 #include "../codec/alac_decoder.h"
+#include "../codec/aac_decoder.h"
 #include "../codec/audio_buffer.h"
 #include "../platform/platform_thread.h"
 #include "fairplay.h"
@@ -60,7 +61,7 @@ public:
 
     /// 配置 AP2 音频（type=96 流的 SETUP，无 ANNOUNCE 时使用）。
     /// AP2 纯音频没有 SDP，编解码信息全在 SETUP stream dict：
-    ///   ct=2 → ALAC（spf=352）；ct=8 → AAC-ELD（压缩透传给渲染器）。
+    ///   ct=2 → ALAC（spf=352）；ct=8 → AAC-ELD（库内置解码器解码）。
     /// @param ct  codec type（UxPlay audio_get_format 同款映射）
     /// @param spf samples per frame
     /// @param sr  采样率（缺失为 0 → 默认 44100）
@@ -148,9 +149,13 @@ private:
 
     // Audio pipeline
     codec::AlacDecoder alac_;
+    codec::AacDecoder aac_;   ///< AAC-ELD（镜像音频）库内置解码器
     codec::AudioBuffer pcm_buffer_;
     AudioConfig audio_cfg_;
     std::string codec_mode_;
+    // AP2 镜像音频（ct=8 AAC-ELD）无 ANNOUNCE：手工构造的 RFC 3640 fmtp
+    // （config=ELD-ASC），供 on_config 后创建 AAC 解码器使用。
+    std::string aac_fmtp_;
     std::atomic<bool> playing_{false};
     std::atomic<bool> video_playing_{false};
 

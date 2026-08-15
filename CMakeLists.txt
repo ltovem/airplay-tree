@@ -62,6 +62,7 @@ set(AIRPLAY2_SOURCES
     src/net/timing.cpp
     src/net/video_rtp.cpp
     src/codec/alac_decoder.cpp
+    src/codec/aac_decoder.cpp
     src/codec/audio_buffer.cpp
     src/codec/nal_reassembler.cpp
     # Apple 官方开源 ALAC 解码器（macosforge/alac，Apache-2.0，vendored）
@@ -112,10 +113,13 @@ elseif(AP2_MACOS OR AP2_IOS)
     find_library(CFNETWORK_LIBRARY CFNetwork)
     find_library(SECURITY_LIBRARY Security)
     find_library(DNSSERVICES_LIBRARY DNSSD)
+    # AAC-ELD 解码器（src/codec/aac_decoder.cpp）依赖 AudioToolbox
+    find_library(AUDIOTOOLBOX_LIBRARY AudioToolbox)
     target_link_libraries(airplay2 PRIVATE
         ${COREFOUNDATION_LIBRARY}
         ${CFNETWORK_LIBRARY}
         ${SECURITY_LIBRARY}
+        ${AUDIOTOOLBOX_LIBRARY}
         pthread
     )
     if(DNSSERVICES_LIBRARY)

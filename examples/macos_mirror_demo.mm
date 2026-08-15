@@ -34,7 +34,6 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 #import <VideoToolbox/VideoToolbox.h>
-#import <AudioToolbox/AudioToolbox.h>
 #import <QuartzCore/QuartzCore.h>
 
 #include <airplay2/airplay2.h>
@@ -143,80 +142,6 @@ std::vector<uint8_t> StripParamSets(const uint8_t* data, size_t len, VideoCodec 
         if (IsParamSetNal(nal, end - begin - off, codec)) continue;
         out.insert(out.end(), data + begin, data + end);
     }
-    return out;
-}
-
-// ---- AAC-ELD 解码辅助（RFC 3640 AU-header 解析 + hex） ----
-
-/*! 把 "k=v;k=v;..." 的 fmtp 切分成 kv 表（值去引号/空白） */
-std::vector<std::pair<std::string, std::string>> ParseFmtpKvs(const std::string& fmtp) {
-    std::vector<std::pair<std::string, std::string>> kvs;
-    std::stringstream ss(fmtp);
-    std::string seg;
-    while (std::getline(ss, seg, ';')) {
-        size_t eq = seg.find('=');
-        if (eq == std::string::npos) continue;
-        std::string k = seg.substr(0, eq);
-        std::string v = seg.substr(eq + 1);
-        auto trim = [](std::string& s) {
-            while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '"')) s.erase(s.begin());
-            while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '"')) s.pop_back();
-        };
-        trim(k); trim(v);
-        if (!k.empty()) kvs.emplace_back(std::move(k), std::move(v));
-    }
-    return kvs;
-}
-
-/*! 十六进制字符串 → 字节 */
-std::vector<uint8_t> HexDecode(const std::string& s) {
-    std::vector<uint8_t> out;
-    auto nib = [](char c) -> int {
-        if (c >= '0' && c <= '9') return c - '0';
-        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-        return -1;
-    };
-    for (size_t i = 0; i + 1 < s.size(); i += 2) {
-        int hi = nib(s[i]), lo = nib(s[i + 1]);
-        if (hi < 0 || lo < 0) break;
-        out.push_back((uint8_t)((hi << 4) | lo));
-    }
-    return out;
-}
-
-/*!
- * @brief 把 AudioSpecificConfig 包装成 AudioToolbox 期望的 MPEG-4 描述符 cookie
- *
- * 与 FFmpeg audiotoolboxdec.c ffat_get_magic_cookie 一致：kAudioFormatMPEG4AAC
- * 的 kAudioConverterDecompressionMagicCookie 不能直接给原始 ASC，而必须包在
- *   ES descriptor(0x03) → DecoderConfig(0x04) → DecoderSpecificInfo(0x05)
- * 三层描述符里，否则 AudioConverterSetProperty 会返回错误（'!dat'）。
- */
-std::vector<uint8_t> BuildAacMagicCookie(const std::vector<uint8_t>& asc) {
-    std::vector<uint8_t> out;
-    auto put_descr = [&out](int tag, unsigned size) {
-        out.push_back((uint8_t)tag);
-        for (int i = 3; i > 0; --i) out.push_back((uint8_t)((size >> (7 * i)) | 0x80));
-        out.push_back((uint8_t)(size & 0x7F));
-    };
-    auto put16 = [&out](uint16_t v) { out.push_back((uint8_t)(v >> 8)); out.push_back((uint8_t)v); };
-    auto put32 = [&out](uint32_t v) {
-        out.push_back((uint8_t)(v >> 24)); out.push_back((uint8_t)(v >> 16));
-        out.push_back((uint8_t)(v >> 8));  out.push_back((uint8_t)v);
-    };
-    unsigned n = (unsigned)asc.size();
-    put_descr(0x03, 3 + 5 + 13 + 5 + n);   // ES descriptor
-    put16(0);                               // ES_ID
-    out.push_back(0x00);                    // flags
-    put_descr(0x04, 13 + 5 + n);            // DecoderConfig descriptor
-    out.push_back(0x40);                    // objectTypeIndication = MPEG-4 Audio
-    out.push_back(0x15);                    // streamType/flags = Audiostream
-    out.push_back(0); out.push_back(0); out.push_back(0); // bufferSizeDB
-    put32(0);                               // maxBitrate
-    put32(0);                               // avgBitrate
-    put_descr(0x05, n);                     // DecoderSpecificInfo
-    out.insert(out.end(), asc.begin(), asc.end());
     return out;
 }
 
@@ -520,6 +445,8 @@ public:
             return Status::ERROR_CODEC;
         }
         configured_ = true;
+        // 每个会话开一个新 WAV（诊断用）：会话结束时 StopQueueLocked 会关闭回填
+        WavOpenLocked();
         return Status::OK;
     }
 
@@ -529,6 +456,7 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         if (!configured_ || !player_ || !pcm_data || num_bytes == 0) return Status::OK;
         pcm_bytes_total_ += num_bytes; // UI 统计：累计解码出的 PCM 字节数
+        WavAppend(pcm_data, num_bytes); // 诊断：落盘供离线验证解码正确性
         pending_.insert(pending_.end(), pcm_data, pcm_data + num_bytes);
         // 限制缓存上限（200ms），避免延迟无限增长
         size_t bpf = BytesPerFrameLocked();
@@ -539,87 +467,6 @@ public:
             }
         }
         DrainLocked();
-        return Status::OK;
-    }
-
-    // ---- AAC-ELD 压缩透传（屏幕镜像音频） ----
-
-    void on_compressed_config(const std::string& codec, const std::string& fmtp,
-                              const AudioConfig& cfg) override {
-        std::lock_guard<std::mutex> lk(mu_);
-        StopAacLocked();
-        // 解析 fmtp 参数（RFC 3640）：config= 十六进制 AudioSpecificConfig 是必须的
-        auto kvs = ParseFmtpKvs(fmtp);
-        std::string config_hex;
-        for (auto& kv : kvs) {
-            if (kv.first == "config") config_hex = kv.second;
-            else if (kv.first == "sizelength") aac_sizelength_ = atoi(kv.second.c_str());
-            else if (kv.first == "indexlength") aac_indexlength_ = atoi(kv.second.c_str());
-            else if (kv.first == "indexdeltaLength" || kv.first == "indexdelta") aac_indexdelta_ = atoi(kv.second.c_str());
-        }
-        auto asc = HexDecode(config_hex);
-        if (asc.empty()) {
-            fprintf(stderr, "[AAC] no config= in fmtp, cannot create decoder\n");
-            return;
-        }
-        // AudioToolbox 需要 MPEG-4 描述符包装的 cookie（不是裸 ASC）
-        auto cookie = BuildAacMagicCookie(asc);
-        // 输入 = AAC（对象类型由 magic cookie 决定：ELD / LC），输出 = PCM16。
-        // 注意：ELD 必须用 kAudioFormatMPEG4AAC_ELD（'aace'）而不是通用的
-        // kAudioFormatMPEG4AAC（'aac '），否则 AudioConverterSetProperty 的
-        // magic cookie 会被拒（实测返回 !dat）。
-        // 判断依据用 cfg.format（session 已置为 AAC_ELD），不要用 codec 字符串——
-        // codec_mode_ 是 "mpeg4-generic" 不含 "eld"。
-        AudioStreamBasicDescription in{};
-        in.mSampleRate = cfg.sample_rate ? cfg.sample_rate : 44100;
-        in.mChannelsPerFrame = cfg.channels ? cfg.channels : 2;
-        in.mFormatID = (cfg.format == AudioFormat::AAC_ELD)
-                           ? kAudioFormatMPEG4AAC_ELD
-                           : kAudioFormatMPEG4AAC;
-        memset(&aac_out_asbd_, 0, sizeof(aac_out_asbd_));
-        aac_out_asbd_.mSampleRate = in.mSampleRate;
-        aac_out_asbd_.mChannelsPerFrame = in.mChannelsPerFrame;
-        aac_out_asbd_.mFormatID = kAudioFormatLinearPCM;
-        aac_out_asbd_.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-        aac_out_asbd_.mBitsPerChannel = 16;
-        aac_out_asbd_.mBytesPerFrame = 2 * in.mChannelsPerFrame;
-        aac_out_asbd_.mBytesPerPacket = aac_out_asbd_.mBytesPerFrame;
-        aac_out_asbd_.mFramesPerPacket = 1;
-
-        OSStatus st = AudioConverterNew(&in, &aac_out_asbd_, &aac_conv_);
-        if (st != noErr) { aac_conv_ = nullptr; return; }
-        st = AudioConverterSetProperty(aac_conv_, kAudioConverterDecompressionMagicCookie,
-                                       (UInt32)cookie.size(), cookie.data());
-        if (st != noErr) {
-            fprintf(stderr, "[AAC] magic cookie rejected (%d), disabling\n", (int)st);
-            StopAacLocked();
-            return;
-        }
-        aac_ready_ = true;
-        fprintf(stderr, "[AAC] decoder ready: %s %.0f Hz %u ch cookie=%zu B\n",
-                codec.c_str(), in.mSampleRate, (unsigned)in.mChannelsPerFrame, cookie.size());
-    }
-
-    Status on_compressed_audio(const uint8_t* data, size_t len,
-                               uint64_t timestamp_us) override {
-        (void)timestamp_us;
-        if (!data || len == 0) return Status::OK;
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!aac_ready_ || !aac_conv_) return Status::OK;
-        // 诊断：前几个 AAC 包打印大小，确认数据真的到达解码器
-        if (aac_packets_.load() < 3)
-            fprintf(stderr, "[AAC] compressed pkt len=%zu first=0x%02X 0x%02X 0x%02X 0x%02X\n",
-                    len, data[0], len > 1 ? data[1] : 0,
-                    len > 2 ? data[2] : 0, len > 3 ? data[3] : 0);
-        aac_bytes_total_ += len;
-        aac_packets_++;
-        // 攒够一批再解码：AudioConverter 的 AAC 解码器有 1 帧 lookahead，
-        // 单包一次调用会产生 0 输出（实测），批量喂 4 个包即可稳定输出。
-        aac_batch_.push_back(std::vector<uint8_t>(data, data + len));
-        if (aac_batch_.size() >= kAacBatchSize) {
-            DrainAacBatchLocked();
-            DrainLocked();
-        }
         return Status::OK;
     }
 
@@ -640,10 +487,7 @@ public:
     }
     void on_flush() override {
         std::lock_guard<std::mutex> lk(mu_);
-        // 先把攒的 AAC 包解出来，避免 FLUSH 丢尾音
-        DrainAacBatchLocked();
         pending_.clear();
-        aac_batch_.clear();
         // 清掉已调度的旧缓冲：AVAudioPlayerNode 的 stop() 会清空调度队列，
         // 若仍处于播放状态则立即恢复 play——否则节点停死后即使继续
         // scheduleBuffer 也不会出声（playing_ 仍为 true，on_play 不会再触发）。
@@ -666,9 +510,6 @@ public:
 
     /// UI 统计：累计收到的 PCM 字节数
     uint64_t pcm_bytes_total() const { return pcm_bytes_total_.load(); }
-    /// UI 统计：累计收到的 AAC 压缩包数 / 字节数
-    uint64_t aac_packets() const { return aac_packets_.load(); }
-    uint64_t aac_bytes_total() const { return aac_bytes_total_.load(); }
     /// UI 统计：当前播放状态（非 const：内部要加锁）
     bool queue_active() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -690,135 +531,63 @@ private:
     bool playing_ = false;
     float volume_ = 1.0f;
 
-    // ---- AAC-ELD 解码状态（AudioConverter） ----
-    AudioConverterRef aac_conv_ = nullptr;
-    AudioStreamBasicDescription aac_out_asbd_{};
-    bool aac_ready_ = false;
-    int aac_sizelength_ = 13;   // RFC 3640 AU-size 位宽
-    int aac_indexlength_ = 3;   // AU-index 位宽
-    int aac_indexdelta_ = 3;    // AU-index-delta 位宽
-    static constexpr size_t kAacBatchSize = 4;  // 攒 4 个包再解码（≈93ms @44.1k）
-    std::vector<std::vector<uint8_t>> aac_batch_; // 待解码的原始 RTP 负载
-    std::atomic<uint64_t> aac_packets_{0};
-    std::atomic<uint64_t> aac_bytes_total_{0};
-    std::atomic<uint64_t> aac_decode_errors_{0};
+    // ---- 诊断：解码 PCM 落盘（/tmp/mirror_pcm.wav）----
+    // 用于离线验证"解码结果是否正确"（与播放链路解耦）：用 afplay / QuickTime
+    // 直接播这个文件，若声音正常说明解码 OK、问题在播放时序；若文件本身有
+    // 杂音/断续则问题在解码。每个会话（on_config）开新文件，关闭时回填 WAV 头。
+    FILE* wav_file_ = nullptr;
+    uint32_t wav_data_size_ = 0;
 
-    // ---- 批量解码输入状态：把所有 AU 拼成一个连续缓冲，回调按 AU 逐个喂 ----
-    struct AacBatchState {
-        const uint8_t* data = nullptr;   // 连续 AU 数据
-        std::vector<size_t> au_offsets;  // 每个 AU 在 data 中的偏移
-        size_t total = 0;
-        size_t idx = 0;
-    };
-    static OSStatus AacBatchInputProc(AudioConverterRef conv, UInt32* numPackets,
-                                      AudioBufferList* data,
-                                      AudioStreamPacketDescription** desc, void* user) {
-        (void)conv;
-        AacBatchState* s = (AacBatchState*)user;
-        if (!s || s->idx >= s->au_offsets.size()) { *numPackets = 0; return noErr; }
-        size_t start = s->au_offsets[s->idx];
-        size_t end = (s->idx + 1 < s->au_offsets.size()) ? s->au_offsets[s->idx + 1] : s->total;
-        data->mNumberBuffers = 1;
-        data->mBuffers[0].mNumberChannels = 0;
-        data->mBuffers[0].mData = (void*)(s->data + start);
-        data->mBuffers[0].mDataByteSize = (UInt32)(end - start);
-        *numPackets = 1;
-        if (desc) {
-            static AudioStreamPacketDescription pd;  // 变量包输入需要 packet description
-            pd.mStartOffset = 0;
-            pd.mVariableFramesInPacket = 0;
-            pd.mDataByteSize = (UInt32)(end - start);
-            *desc = &pd;
+    void WavClose() {
+        if (wav_file_) {
+            // 回填 RIFF 与 data 段大小（之前占位写了 0），否则播放器按 0 长度处理
+            if (wav_data_size_ > 0) {
+                uint32_t riff_sz = 36 + wav_data_size_;
+                uint8_t b[4] = {(uint8_t)riff_sz, (uint8_t)(riff_sz >> 8),
+                                (uint8_t)(riff_sz >> 16), (uint8_t)(riff_sz >> 24)};
+                fseek(wav_file_, 4, SEEK_SET);
+                fwrite(b, 1, 4, wav_file_);
+                uint8_t d[4] = {(uint8_t)wav_data_size_, (uint8_t)(wav_data_size_ >> 8),
+                                (uint8_t)(wav_data_size_ >> 16), (uint8_t)(wav_data_size_ >> 24)};
+                fseek(wav_file_, 40, SEEK_SET);
+                fwrite(d, 1, 4, wav_file_);
+            }
+            fclose(wav_file_);
+            wav_file_ = nullptr;
         }
-        s->idx++;
-        return noErr;
+        wav_data_size_ = 0;
     }
 
-    /*! 把一批原始负载解析成 AU 连续缓冲（调用方必须已持有 mu_） */
-    void ParseBatchToAus(std::vector<uint8_t>& cont, std::vector<size_t>& offsets) {
-        cont.clear();
-        offsets.clear();
-        for (auto& raw : aac_batch_) {
-            if (raw.size() < 2) continue;
-            unsigned hdr_bits = (unsigned)((raw[0] << 8) | raw[1]);
-            size_t payload_off = 2 + (hdr_bits + 7) / 8;
-            if (payload_off > raw.size()) payload_off = raw.size();
-            if (hdr_bits == 0) {
-                // 无 AU-header：整个剩余负载就是一个 AU
-                if (raw.size() > 2) {
-                    offsets.push_back(cont.size());
-                    cont.insert(cont.end(), raw.begin() + 2, raw.end());
-                }
-                continue;
-            }
-            // RFC 3640：AU-size(sizelength) [+ AU-index] [+ AU-index-delta] ...
-            unsigned pos = 0;
-            size_t au_off = payload_off;
-            int idx = 0;
-            while (au_off < raw.size()) {
-                if (pos + (unsigned)aac_sizelength_ > hdr_bits) break;
-                size_t au_size = 0;
-                for (int b = 0; b < aac_sizelength_ && pos < hdr_bits; ++b, ++pos) {
-                    int byte_i = 2 + (int)(pos >> 3);
-                    if (byte_i >= (int)raw.size()) { au_size = 0; break; }
-                    au_size = (au_size << 1) | ((raw[byte_i] >> (7 - (pos & 7))) & 1);
-                }
-                int skip_bits = (idx == 0) ? aac_indexlength_ : aac_indexdelta_;
-                for (int b = 0; b < skip_bits && pos < hdr_bits; ++b) ++pos;
-                if (au_size == 0 || au_off + au_size > raw.size()) break;
-                offsets.push_back(cont.size());
-                cont.insert(cont.end(), raw.begin() + au_off, raw.begin() + au_off + au_size);
-                au_off += au_size;
-                idx++;
-            }
-            if (idx == 0) {
-                // 头部解析异常：把 AU-headers 之后的数据整体当一个 AU
-                offsets.push_back(cont.size());
-                cont.insert(cont.end(), raw.begin() + payload_off, raw.end());
-            }
-        }
+    void WavOpenLocked() {
+        WavClose();
+        wav_file_ = fopen("/tmp/mirror_pcm.wav", "wb");
+        if (!wav_file_) return;
+        // WAV 头（44B，PCM16 交错），大小字段先写 0，关闭时回填
+        uint16_t ch = (uint16_t)cfg_.channels;
+        uint32_t sr = cfg_.sample_rate;
+        uint32_t bpf = (uint32_t)ch * 2;
+        uint32_t byte_rate = sr * bpf;
+        uint8_t hdr[44] = {0};
+        memcpy(hdr, "RIFF", 4);
+        memcpy(hdr + 8, "WAVE", 4);
+        memcpy(hdr + 12, "fmt ", 4);
+        hdr[16] = 16;               // fmt chunk 大小
+        hdr[20] = 1;                // PCM
+        hdr[22] = (uint8_t)ch; hdr[23] = (uint8_t)(ch >> 8);
+        hdr[24] = (uint8_t)sr; hdr[25] = (uint8_t)(sr >> 8);
+        hdr[26] = (uint8_t)(sr >> 16); hdr[27] = (uint8_t)(sr >> 24);
+        hdr[28] = (uint8_t)byte_rate; hdr[29] = (uint8_t)(byte_rate >> 8);
+        hdr[30] = (uint8_t)(byte_rate >> 16); hdr[31] = (uint8_t)(byte_rate >> 24);
+        hdr[32] = (uint8_t)bpf; hdr[33] = (uint8_t)(bpf >> 8);
+        hdr[34] = 16;               // bits per sample
+        memcpy(hdr + 36, "data", 4);
+        fwrite(hdr, 1, 44, wav_file_);
     }
 
-    /*! 解码一批累积的 AAC 包，输出 PCM16 到 pending_（调用方必须已持有 mu_） */
-    void DrainAacBatchLocked() {
-        if (!aac_ready_ || !aac_conv_ || aac_batch_.empty()) return;
-        std::vector<uint8_t> cont;
-        std::vector<size_t> offsets;
-        ParseBatchToAus(cont, offsets);
-        aac_batch_.clear();
-        if (offsets.empty()) return;
-
-        AacBatchState st{cont.data(), offsets, cont.size(), 0};
-        // 循环解码直到该批全部消费完
-        for (int guard = 0; guard < 64; ++guard) {
-            uint8_t outbuf[131072];
-            AudioBufferList abl{};
-            abl.mNumberBuffers = 1;
-            abl.mBuffers[0].mData = outbuf;
-            abl.mBuffers[0].mDataByteSize = sizeof(outbuf);
-            UInt32 npk = 8192;
-            OSStatus st2 = AudioConverterFillComplexBuffer(aac_conv_, AacBatchInputProc,
-                                                           &st, &npk, &abl, nullptr);
-            if (st2 != noErr) {
-                if (aac_decode_errors_.fetch_add(1) < 8)
-                    fprintf(stderr, "[AAC] decode error %d\n", (int)st2);
-                break;
-            }
-            size_t produced = abl.mBuffers[0].mDataByteSize;
-            if (produced > 0) {
-                pcm_bytes_total_ += produced;
-                pending_.insert(pending_.end(), outbuf, outbuf + produced);
-            }
-            if (st.idx >= offsets.size() && produced == 0) break;
-        }
-        // 限制缓存上限（200ms），避免延迟无限增长
-        size_t bpf = BytesPerFrameLocked();
-        if (bpf > 0) {
-            size_t max_pending = (size_t)(cfg_.sample_rate * bpf * 200 / 1000);
-            if (max_pending > 0 && pending_.size() > max_pending) {
-                pending_.erase(pending_.begin(), pending_.begin() + (pending_.size() - max_pending));
-            }
-        }
+    void WavAppend(const uint8_t* data, size_t len) {
+        if (!wav_file_ || !data || len == 0) return;
+        fwrite(data, 1, len, wav_file_);
+        wav_data_size_ += (uint32_t)len;
     }
 
     /*! 当前每帧字节数（PCM16 交错；调用方必须已持有 mu_） */
@@ -865,25 +634,16 @@ private:
         }
     }
 
-    void StopAacLocked() {
-        aac_ready_ = false;
-        if (aac_conv_) {
-            AudioConverterDispose(aac_conv_);
-            aac_conv_ = nullptr;
-        }
-    }
-
     void StopQueueLocked() {
         configured_ = false;
         pending_.clear();
-        aac_batch_.clear();
         if (player_) [player_ stop];
         if (engine_) [engine_ stop];
         engine_ = nil;
         player_ = nil;
         fmt_ = nil;
         playing_ = false;
-        StopAacLocked();
+        WavClose();  // 诊断：会话结束，关闭并回填 WAV 头
     }
     void StopQueue() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -1140,15 +900,14 @@ static std::atomic<bool> g_running{true};
     });
 }
 
-// 每秒刷新统计行：音频 PCM 流量 / AAC 包数 / 队列状态 / 视频帧数
+// 每秒刷新统计行：音频 PCM 流量 / 队列状态 / 视频帧数
 - (void)updateStats {
     if (!g_audio || !g_video || !self.statsLabel) return;
     const char* queue_state = g_audio->queue_active() ? "播放中" : "未播放";
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "audio: %llu B PCM | %llu AAC包 | 队列 %s | video: %llu 帧 | 音量 %.2f",
+                  "audio: %llu B PCM | 队列 %s | video: %llu 帧 | 音量 %.2f",
                   (unsigned long long)g_audio->pcm_bytes_total(),
-                  (unsigned long long)g_audio->aac_packets(),
                   queue_state,
                   (unsigned long long)g_video->frames_total(),
                   g_audio->get_volume());
