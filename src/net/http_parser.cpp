@@ -164,7 +164,16 @@ size_t HttpRequestParser::parse(const uint8_t* data, size_t len) {
             }
             case S_HEADERS_DONE: {
                 body_expected_ = (size_t)std::max<int64_t>(0, req_.content_length());
-                if (body_expected_ == 0) {
+                // Transfer-Encoding: chunked 优先级高于 Content-Length
+                std::string te = req_.header("Transfer-Encoding");
+                for (char& c : te) c = (char)std::tolower((unsigned char)c);
+                body_is_chunked_ = (te.find("chunked") != std::string::npos);
+                if (body_is_chunked_) {
+                    // chunked：line_buffer_ 开始累积 size 行的十六进制字符
+                    line_buffer_.clear();
+                    chunk_left_ = 0;
+                    state_ = S_CHUNK_SIZE;
+                } else if (body_expected_ == 0) {
                     state_ = S_COMPLETE;
                 } else {
                     req_.body.reserve(body_expected_);
@@ -182,6 +191,130 @@ size_t HttpRequestParser::parse(const uint8_t* data, size_t len) {
                 if (req_.body.size() == body_expected_) state_ = S_COMPLETE;
                 break;
             }
+            // -------- chunked 解码状态机（RFC 7230 §4.1）-------------------
+            //  简化：忽略 chunk-ext（";..."）、忽略 trailer 字段，
+            //  对 AirPlay 2 实际包完全够用。
+            //  状态序列：
+            //   S_CHUNK_SIZE：逐字节累积到 line_buffer_，遇 \r 为止
+            //   S_CHUNK_SIZE_CR → 期望 \n
+            //   S_CHUNK_DATA：读 chunk_left_ 字节进 body
+            //   S_CHUNK_DATA_CR / _LF：chunk 数据后 "\r\n"
+            //   下一个 size 再回到 S_CHUNK_SIZE
+            //   size=0 → S_CHUNK_TRAILER 扫到空行 → S_COMPLETE
+            case S_CHUNK_SIZE: {
+                while (consumed < len) {
+                    uint8_t c = data[consumed];
+                    if (c == '\r') { consumed++; state_ = S_CHUNK_SIZE_CR; break; }
+                    if (c == '\n') { consumed++; break; }
+                    line_buffer_.push_back((char)c);
+                    consumed++;
+                }
+                if (state_ == S_CHUNK_SIZE_CR) break; // 下一轮处理 LF
+                // '\n' 直接结束本行 → 解析 size
+                // 或者遇到异常字符结束（比如空 line_buffer_）——先解析
+                {
+                    // 把 line_buffer_ 分号前的部分当作 hex
+                    std::string& lb = line_buffer_;
+                    size_t semi = lb.find(';');
+                    std::string hex = (semi == std::string::npos) ? lb : lb.substr(0, semi);
+                    chunk_left_ = 0;
+                    for (char hc : hex) {
+                        int v;
+                        if (hc >= '0' && hc <= '9') v = hc - '0';
+                        else if (hc >= 'a' && hc <= 'f') v = 10 + (hc - 'a');
+                        else if (hc >= 'A' && hc <= 'F') v = 10 + (hc - 'A');
+                        else { state_ = S_ERROR; return consumed; }
+                        chunk_left_ = (chunk_left_ << 4) | (size_t)v;
+                    }
+                    lb.clear();
+                    if (chunk_left_ == 0) {
+                        // terminal chunk → 扫 trailer，空行即结束
+                        state_ = S_CHUNK_TRAILER;
+                        line_buffer_.clear();
+                    } else {
+                        state_ = S_CHUNK_DATA;
+                    }
+                }
+                break;
+            }
+            case S_CHUNK_SIZE_CR: {
+                if (consumed >= len) break;
+                if (data[consumed] != '\n') { state_ = S_ERROR; return consumed; }
+                consumed++;
+                // 现在解析 line_buffer_ 中累积的 hex
+                {
+                    std::string& lb = line_buffer_;
+                    size_t semi = lb.find(';');
+                    std::string hex = (semi == std::string::npos) ? lb : lb.substr(0, semi);
+                    chunk_left_ = 0;
+                    for (char hc : hex) {
+                        int v;
+                        if (hc >= '0' && hc <= '9') v = hc - '0';
+                        else if (hc >= 'a' && hc <= 'f') v = 10 + (hc - 'a');
+                        else if (hc >= 'A' && hc <= 'F') v = 10 + (hc - 'A');
+                        else { state_ = S_ERROR; return consumed; }
+                        chunk_left_ = (chunk_left_ << 4) | (size_t)v;
+                    }
+                    lb.clear();
+                    if (chunk_left_ == 0) {
+                        state_ = S_CHUNK_TRAILER;
+                        line_buffer_.clear();
+                    } else {
+                        state_ = S_CHUNK_DATA;
+                    }
+                }
+                break;
+            }
+            case S_CHUNK_DATA: {
+                size_t take = std::min(chunk_left_, len - consumed);
+                if (take > 0) {
+                    req_.body.insert(req_.body.end(), data + consumed, data + consumed + take);
+                    consumed += take;
+                    chunk_left_ -= take;
+                }
+                if (chunk_left_ == 0) state_ = S_CHUNK_DATA_CR;
+                break;
+            }
+            case S_CHUNK_DATA_CR: {
+                if (consumed >= len) break;
+                if (data[consumed] != '\r') { state_ = S_ERROR; return consumed; }
+                consumed++;
+                state_ = S_CHUNK_DATA_LF;
+                break;
+            }
+            case S_CHUNK_DATA_LF: {
+                if (consumed >= len) break;
+                if (data[consumed] != '\n') { state_ = S_ERROR; return consumed; }
+                consumed++;
+                // 下一个 chunk 从 size 行开始
+                line_buffer_.clear();
+                state_ = S_CHUNK_SIZE;
+                break;
+            }
+            case S_CHUNK_TRAILER: {
+                // 读行直到空行；AirPlay 一般直接空行
+                // 逐字符累加到 line_buffer_，遇到 \r\n 检查是否空
+                while (consumed < len) {
+                    uint8_t c = data[consumed++];
+                    if (c == '\r') {
+                        if (consumed < len && data[consumed] == '\n') consumed++;
+                        if (line_buffer_.empty()) {
+                            state_ = S_COMPLETE;
+                        } else {
+                            // 一条 trailer header（忽略）
+                            line_buffer_.clear();
+                        }
+                        break;
+                    } else if (c == '\n') {
+                        if (line_buffer_.empty()) state_ = S_COMPLETE;
+                        else line_buffer_.clear();
+                        break;
+                    } else {
+                        line_buffer_.push_back((char)c);
+                    }
+                }
+                break;
+            }
             default:
                 return consumed;
         }
@@ -193,6 +326,8 @@ HttpRequest HttpRequestParser::take_request() {
     HttpRequest r = std::move(req_);
     state_ = S_METHOD;
     body_expected_ = 0;
+    body_is_chunked_ = false;
+    chunk_left_ = 0;
     header_so_far_ = 0;
     line_buffer_.clear();
     cur_header_name_.clear();

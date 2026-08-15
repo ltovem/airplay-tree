@@ -13,6 +13,12 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
+#include <cstdint>
+#include <cstddef>
+
+// util::PlistValue 前向声明，避免 include plist.h 造成反向依赖
+namespace airplay2 { namespace util { class PlistValue; } }
 
 namespace airplay2 {
 namespace net {
@@ -81,6 +87,30 @@ struct RtspHandlers {
 
     /// Pin code callback: should we accept this code?
     std::function<bool(const std::string& client_ip, const std::string& pin)> on_pin;
+
+    // --- AirPlay 2 控制端点 ---
+    // POST /action — 带 binary plist 播放控制（play / pause / seek / volume /
+    //                setOutput / removeOutput 等 AirPlay 2 多房间控制）
+    //   第一个参数：已解析的 plist（dict）；未解析时 dict 为空
+    //   第二个参数：原始 body 字节（方便用户自行扩展解析）
+    //   返回：要回送的 response body（binary or xml plist；空则默认 200 OK + 空 body）
+    std::function<std::vector<uint8_t>(uint64_t conn_id, const util::PlistValue& dict,
+                                       const uint8_t* raw, size_t raw_len)> on_action;
+
+    // PUT /rate — AirPlay 2 播放速度控制；header 带 value 参数
+    //   on_rate(conn_id, rate)，rate=1.0 为正常播放，0.0 为暂停
+    std::function<void(uint64_t conn_id, double rate)> on_rate;
+
+    // POST /feedback — Apple 私有 TCP 反馈通道，接收端可以空响应 200
+    std::function<std::vector<uint8_t>(uint64_t conn_id, const uint8_t* body, size_t len)> on_feedback;
+
+    // POST /event — 发送端发事件（volume changed / nowPlaying 等）
+    std::function<void(uint64_t conn_id, const util::PlistValue& dict,
+                       const uint8_t* raw, size_t raw_len)> on_event;
+
+    // PUT /metadata / POST /metadata — 正在播放的曲目/封面信息（通常是 binary plist）
+    std::function<void(uint64_t conn_id, const util::PlistValue& dict,
+                       const uint8_t* raw, size_t raw_len)> on_metadata;
 
     /// Fallback: allow embedding /play, /scrub, /property endpoints
     std::function<HttpResponse(const HttpRequest&, Connection&)> on_unknown;

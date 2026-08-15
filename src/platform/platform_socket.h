@@ -30,6 +30,8 @@ struct SocketAddr {
     uint16_t    port = 0;
     bool        is_v6 = false;
     std::string to_string() const;
+    /// 简易有效性：ip 非空 且 端口非 0
+    bool valid() const { return !ip.empty() && port != 0; }
 };
 
 /*!
@@ -83,6 +85,9 @@ public:
 
     /// UDP: sendto a specific address
     IoResult sendto(const void* data, size_t len, const SocketAddr& dst);
+
+    /// UDP: 便捷 sendto（直接 ip 字符串 + 端口），内部构造 SocketAddr
+    IoResult sendto(const void* data, size_t len, const std::string& ip, uint16_t port);
 
     /// UDP: recvfrom
     IoResult recvfrom(void* buf, size_t len, SocketAddr* src);

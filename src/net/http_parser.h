@@ -64,6 +64,11 @@ struct HttpResponse {
  * Feed bytes via parse(). When a full request is ready, parse()
  * returns the number of bytes consumed from the input. You then
  * call take_request() to retrieve it.
+ *
+ * 支持两种 body 传帧模式：
+ *   1. Content-Length: N   → 精确读 N 字节
+ *   2. Transfer-Encoding: chunked   → 按 16 进制 chunk size 解码直到 0\r\n\r\n
+ *      AirPlay 2 /action /event /feedback 有时会用 chunked 传 binary plist。
  */
 class HttpRequestParser {
 public:
@@ -75,6 +80,13 @@ public:
         S_HEADER_VALUE,
         S_HEADERS_DONE,
         S_BODY,
+        S_CHUNK_SIZE,
+        S_CHUNK_SIZE_CR,
+        S_CHUNK_SIZE_LF,
+        S_CHUNK_DATA,
+        S_CHUNK_DATA_CR,
+        S_CHUNK_DATA_LF,
+        S_CHUNK_TRAILER,
         S_COMPLETE,
         S_ERROR
     };
@@ -94,7 +106,9 @@ public:
 private:
     State state_ = S_METHOD;
     HttpRequest req_;
-    size_t body_expected_ = 0;
+    size_t body_expected_ = 0;   // Content-Length 模式下还需读多少；0=不使用
+    bool   body_is_chunked_ = false; // Transfer-Encoding 模式
+    size_t chunk_left_ = 0;      // 当前 chunk 剩余字节
     size_t header_so_far_ = 0;
     std::string cur_header_name_;
     std::string cur_header_value_;

@@ -3,6 +3,7 @@
  */
 #include "rtsp_server.h"
 #include "../platform/platform_log.h"
+#include "../util/plist.h"
 #include <sstream>
 #include <cstring>
 #include <cstdio>     // std::snprintf（构建 RTSP/SDP 响应行）
@@ -75,7 +76,11 @@ bool parse_sdp(const std::string& sdp, SdpInfo& out) {
                 size_t eq = val.find(':');
                 std::string key = (eq == std::string::npos) ? val : val.substr(0, eq);
                 std::string vv  = (eq == std::string::npos) ? ""  : val.substr(eq + 1);
-                if (key == "rtpmap") {
+                // 去掉 key 里冒号前的 payload-type 后缀，例如 "fmtp:96" / "rtpmap:96"
+                std::string base_key = key;
+                size_t col = base_key.find(':');
+                if (col != std::string::npos) base_key = base_key.substr(0, col);
+                if (base_key == "rtpmap") {
                     // a=rtpmap:96 AppleLossless/44100/2
                     size_t sp = vv.find(' ');
                     if (sp != std::string::npos) {
@@ -90,15 +95,38 @@ bool parse_sdp(const std::string& sdp, SdpInfo& out) {
                             }
                         }
                     }
-                } else if (key == "fmtp") {
+                } else if (base_key == "fmtp") {
                     out.fmtp = vv;
-                    // fmtp:96 0 16 4096 10 14 2 255 0 0 44100 (ALAC magic cookie)
-                } else if (key == "control") {
+                } else if (base_key == "control") {
                     // a=control:rtsp://.../sessionid
-                } else if (key == "ts-clk" || key == "ts-refclk") {
+                } else if (base_key == "ts-clk" || base_key == "ts-refclk") {
                     try { out.rtp_time_base = std::stoull(vv); } catch (...) {}
-                } else if (key == "es-charset" || key == "es-parameters") {
-                    // AES key material
+                } else if (base_key == "aeskey") {
+                    // a=aeskey:<hex>  — AirTunes/AirPlay 明文 hex 16 字节 AES-128 key
+                    out.aes_key = vv;
+                } else if (base_key == "aesiv") {
+                    // a=aesiv:<hex> — 16 字节初始 IV / counter
+                    out.aes_iv = vv;
+                } else if (base_key == "es-charset" || base_key == "es-parameters") {
+                    // 某些发送端会把 aeskey 放在 es-parameters 里，
+                    // 若 aes_key 还没填充就尝试从这里拿，key=value 形式。
+                    // 简化：只在 aes_key/aes_iv 仍空时扫一下 aeskey= 片段
+                    if (out.aes_key.empty()) {
+                        size_t p = vv.find("aeskey=");
+                        if (p != std::string::npos) {
+                            size_t s = p + 7;
+                            size_t e = vv.find(';', s);
+                            out.aes_key = vv.substr(s, (e == std::string::npos ? std::string::npos : e - s));
+                        }
+                    }
+                    if (out.aes_iv.empty()) {
+                        size_t p = vv.find("aesiv=");
+                        if (p != std::string::npos) {
+                            size_t s = p + 6;
+                            size_t e = vv.find(';', s);
+                            out.aes_iv = vv.substr(s, (e == std::string::npos ? std::string::npos : e - s));
+                        }
+                    }
                 }
                 break;
             }
@@ -317,6 +345,91 @@ void RtspServer::install_routes(const DeviceInfo& dev) {
         if (handlers_.on_set_param) handlers_.on_set_param(c.id(), body_in);
         return make_rtsp_ok(req.cseq());
     }, false);
+
+    // POST /action — AirPlay 2 播放控制（binary plist 主体）
+    // 常见字段：category="playback" / command="play" / params={...}
+    // AirPlay 2 多房间扩展：command="setOutput" / "removeOutput" / "groupJoin"
+    http_.add_route("POST", "/action", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        util::PlistValue dict;
+        if (!req.body.empty()) {
+            util::parse_plist(req.body.data(), req.body.size(), dict);
+        }
+        std::vector<uint8_t> resp_body;
+        if (handlers_.on_action) {
+            resp_body = handlers_.on_action(c.id(), dict, req.body.data(), req.body.size());
+        }
+        HeaderMap extra;
+        if (!resp_body.empty()) {
+            // 默认返回二进制 plist；上层给空就用空 body 200
+            extra["Content-Type"] = "application/x-apple-binary-plist";
+        }
+        return make_rtsp_ok(req.cseq(), extra, std::move(resp_body));
+    }, true);
+
+    // PUT /rate — 播放速度/时间轴请求
+    // 典型请求：x-apple-rate: 1.0 / x-apple-post-sync-time: ...
+    // 缺少 handler 时也必须返回 200（否则发送端可能认为设备"卡住"）
+    http_.add_route("PUT", "/rate", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        double rate = 1.0;
+        std::string r = req.header("x-apple-rate");
+        if (r.empty()) r = req.header("Rate");
+        if (!r.empty()) {
+            try { rate = std::stod(r); } catch (...) { rate = 1.0; }
+        }
+        if (handlers_.on_rate) handlers_.on_rate(c.id(), rate);
+        AP2_LOGD("rtsp: /rate conn=%lu rate=%.3f", (unsigned long)c.id(), rate);
+        HeaderMap extra;
+        extra["Session"] = "airplay2lib-" + std::to_string(c.id());
+        return make_rtsp_ok(req.cseq(), extra);
+    }, false);
+
+    // POST /feedback — 某些 AirPlay 发送端周期发起 feedback 通道，
+    // 内容是一个 binary plist，包含网络质量 / 抖动 / RTT 估计。
+    // 接收端不需要解析就可以回 200，空 response 即可。
+    http_.add_route("POST", "/feedback", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        std::vector<uint8_t> resp_body;
+        if (handlers_.on_feedback) {
+            resp_body = handlers_.on_feedback(c.id(), req.body.data(), req.body.size());
+        }
+        HeaderMap extra;
+        extra["Content-Type"] = "application/x-apple-binary-plist";
+        return make_rtsp_ok(req.cseq(), extra, std::move(resp_body));
+    }, true);
+
+    // POST /event — 播放事件（volume changed / nowPlaying / queue update 等）
+    http_.add_route("POST", "/event", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        util::PlistValue dict;
+        if (!req.body.empty()) {
+            util::parse_plist(req.body.data(), req.body.size(), dict);
+        }
+        if (handlers_.on_event) {
+            handlers_.on_event(c.id(), dict, req.body.data(), req.body.size());
+        }
+        return make_rtsp_ok(req.cseq());
+    }, true);
+
+    // PUT /metadata + POST /metadata — 正在播放的曲目元信息
+    // 常见字段：artist / album / title / duration / artwork（二进制 data）
+    http_.add_route("PUT", "/metadata", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        util::PlistValue dict;
+        if (!req.body.empty()) {
+            util::parse_plist(req.body.data(), req.body.size(), dict);
+        }
+        if (handlers_.on_metadata) {
+            handlers_.on_metadata(c.id(), dict, req.body.data(), req.body.size());
+        }
+        return make_rtsp_ok(req.cseq());
+    }, true);
+    http_.add_route("POST", "/metadata", [this](const HttpRequest& req, Connection& c) -> HttpResponse {
+        util::PlistValue dict;
+        if (!req.body.empty()) {
+            util::parse_plist(req.body.data(), req.body.size(), dict);
+        }
+        if (handlers_.on_metadata) {
+            handlers_.on_metadata(c.id(), dict, req.body.data(), req.body.size());
+        }
+        return make_rtsp_ok(req.cseq());
+    }, true);
 
     // Default handler
     http_.set_default_handler([this](const HttpRequest& req, Connection& c) -> HttpResponse {

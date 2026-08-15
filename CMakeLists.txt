@@ -57,8 +57,12 @@ set(AIRPLAY2_SOURCES
     src/net/http_server.cpp
     src/net/rtsp_server.cpp
     src/net/rtp_receiver.cpp
+    src/net/rtcp.cpp
+    src/net/timing.cpp
     src/codec/alac_decoder.cpp
     src/codec/audio_buffer.cpp
+    src/crypto/aes_ctr.cpp
+    src/util/plist.cpp
     src/core/airplay_server_impl.cpp
     src/core/airplay_session_impl.cpp
     src/core/airplay_pairing.cpp

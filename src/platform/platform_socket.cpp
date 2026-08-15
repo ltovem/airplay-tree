@@ -245,6 +245,14 @@ IoResult Socket::sendto(const void* data, size_t len, const SocketAddr& dst) {
     return r;
 }
 
+IoResult Socket::sendto(const void* data, size_t len, const std::string& ip, uint16_t port) {
+    SocketAddr dst;
+    dst.ip = ip;
+    dst.port = port;
+    dst.is_v6 = (ip.find(':') != std::string::npos);
+    return sendto(data, len, dst);
+}
+
 IoResult Socket::recvfrom(void* buf, size_t len, SocketAddr* src) {
     IoResult r;
     if (!valid() || proto_ != SocketProtocol::UDP) return r;

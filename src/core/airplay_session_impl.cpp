@@ -33,10 +33,14 @@ SessionStats SessionImpl::stats() const {
 
 bool SessionImpl::allocate_ports(int remote_ports[3], uint16_t port_min, uint16_t port_max,
                                   int local_ports[3]) {
-    (void)remote_ports;
     if (!rtp_.open(port_min, port_max, rtp_local_ports_)) {
         AP2_LOGE("session: could not allocate RTP ports in %u-%u", port_min, port_max);
         return false;
+    }
+    // 把 SETUP 里拿到的 client_ip + client_port 三元组传给 RtpReceiver，
+    // 供 RR / timing response 回送时使用（穿过 NAT）。
+    if (!client_addr_.empty() && remote_ports) {
+        rtp_.set_remote_address(client_addr_, remote_ports);
     }
     for (int i = 0; i < 3; ++i) local_ports[i] = rtp_local_ports_[i];
     return true;
@@ -50,6 +54,11 @@ void SessionImpl::configure_audio(const net::SdpInfo& sdp) {
     AP2_LOGI("session %lu: configure audio %s sr=%u ch=%u",
              (unsigned long)id_, codec_mode_.c_str(),
              audio_cfg_.sample_rate, audio_cfg_.channels);
+
+    // 若 SDP 里携带 AES key/iv，先配置给 RtpReceiver，后续 RTP 包到了就自动解密
+    if (!sdp.aes_key.empty() || !sdp.aes_iv.empty()) {
+        rtp_.set_decryption_params(sdp.aes_key, sdp.aes_iv);
+    }
 
     // Default output format and decoder
     if (!codec_mode_.empty()) {

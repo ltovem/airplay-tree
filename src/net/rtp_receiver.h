@@ -28,6 +28,9 @@
 
 #include "../platform/platform_socket.h"
 #include "../platform/platform_thread.h"
+#include "../crypto/aes_ctr.h"
+#include "rtcp.h"
+#include "timing.h"
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -95,7 +98,37 @@ public:
     void stop();
 
     /// 丢弃所有缓冲（例如 FLUSH / seek 时，避免旧时间戳被吐出来）
+    /// 同时会重置 AES-CTR 计数器到初始 IV（ANNOUNCE 给的），避免
+    /// FLUSH 之后计数器错位造成后续包解出全噪声。
     void flush();
+
+    /*!
+     * @brief 设置 AES-128-CTR 解密参数（ANNOUNCE SDP 解析结果）
+     *
+     * AirPlay 2 发送端如果在 SDP 里放了 a=aeskey / a=aesiv，
+     * 后续所有 RTP audio payload 都会以 AES-128-CTR 模式加密。
+     * 调用方把 hex 字符串原样传入（如 "5b...32 字节 hex"），
+     * 内部会 hex 解码后 set_key。未调用或 hex 长度非法时，
+     * RTP 负载原样交付（等同于不加密的路径）。
+     *
+     * @return true = 解码成功；false = hex 长度/字符不合法，不生效
+     */
+    bool set_decryption_params(const std::string& aes_key_hex,
+                               const std::string& aes_iv_hex);
+
+    /*!
+     * @brief 告诉 RtpReceiver 发送端的 UDP 地址，用于回 RR / timing response
+     *
+     * SETUP 请求里 Transport header 带 client_port=X-Y，
+     * AirPlay 约定：
+     *   - remote data      = X   （接收端不会往 data 发包）
+     *   - remote control   = X+1 （接收端需要往这里发 RR）
+     *   - remote timing    = X+2 （接收端需要往这里发 timing response）
+     *
+     * 三端口连续的约定也和本地一致，所以 session 传 [X, X+1, X+2] 进来。
+     * start() 之前调用，保证收到首个 RTCP SR 就能即时回 RR。
+     */
+    void set_remote_address(const std::string& client_ip, int remote_ports[3]);
 
     /*!
      * @brief 运行时统计（由 receiver 线程原子更新，外部读是快照）
@@ -114,17 +147,32 @@ public:
     };
     Stats stats() const { return stats_; }
 
+    /// 是否已收到 RTCP SR（判断 NTP 锚点拿到了没）
+    bool has_rtcp_sr() const { return rtcp_.has_sr(); }
+
+    /// 最近一次 RTCP SR（用于外部打印日志或音视频同步）
+    const RtcpSrInfo& last_rtcp_sr() const { return rtcp_.last_sr(); }
+
 private:
     // ---- 线程主循环 -----------------------------------------------------------
     //   select(data_sock_ | ctrl_sock_ | timing_sock_, 100ms timeout)
-    //   - 可读 → 按 socket 分发处理（RTP 解码 / RTCP 丢弃但统计 / Timing 丢弃）
-    //   - 超时 → 检查 jbuffer_ 是否"缺包太久"，必要时推进丢包计数
+    //   - 可读 → 按 socket 分发处理：
+    //       * data   → RTP 解码 → 抖动缓冲 → emit_ready
+    //       * ctrl   → RTCP::handle_packet（解析 SR） + 定期用它的地址回 RR
+    //       * timing → Timing::handle_packet → 非空就用 sendto 回
+    //   - 超时 → 检查 jbuffer_ 是否"缺包太久"，必要时推进丢包计数；
+    //            同时检查"距离上次发 RR 是否超过 5 秒"，超过就回一个。
     void receiver_worker();
 
     // ---- 抖动缓冲弹出 ---------------------------------------------------------
     //   从 jbuffer_.begin() 起按 seq 连续弹出，每次弹出会让 next_expected_seq_++，
     //   并触发 packet_cb_ 回调。遇到缺口立即停止，等待后续包或超时判丢。
     void emit_ready();
+
+    // ---- 按需发 RTCP RR -------------------------------------------------------
+    //   每 5 秒或 RR 间隔到期时构造 RR 包并通过 ctrl_sock_ 发往 sender_ip_+ctrl_port_
+    //   参数来源：rtcp_.last_sr() 的 sender_ssrc，jitter/lost/highest_seq 来自 stats_
+    void maybe_send_rr();
 
     // ---- socket / thread ------------------------------------------------------
     platform::Socket data_sock_;    ///< port1: RTP audio data（UDP）
@@ -133,6 +181,30 @@ private:
     platform::Thread worker_;       ///< 接收线程
     std::atomic<bool> running_{false};
     AudioPacketCb packet_cb_;       ///< 有序输出回调（无锁，只在 worker 访问）
+
+    // ---- 远端地址（发 RR / timing response 用）--------------------------------
+    //   ANNOUNCE 拿到的 source_ip 或 SETUP client_ip。
+    //   control / timing 端口来自 SETUP client_port 的第 2/3 个。
+    std::string         sender_ip_;
+    int                 remote_ctrl_port_   = 0;
+    int                 remote_timing_port_ = 0;
+    // 远端"最后一次向我们发 ctrl / timing 包"的 peer，作为备用地址：
+    // 某些客户端的真实发送端口与 SETUP 声明不一致（NAT/端口漂移），
+    // 这里用最近一次 recvfrom 的 from 地址优先。
+    platform::SocketAddr ctrl_peer_;
+    platform::SocketAddr timing_peer_;
+
+    // ---- 协议处理子模块（都只在 worker 线程使用，无锁）------------------------
+    RtcpHandler          rtcp_;        ///< 解析 SR + 构造 RR
+    TimingHandler        timing_;      ///< 解析 timing request + 构造 response
+    crypto::AesCtr       aes_;         ///< AES-128-CTR 解密（逐包 process）
+    // RTP jitter 估算（RFC 3550 A.8）：给 RR 里的 jitter 字段，
+    // 不用很精确，AirPlay 发送端只用它做大致拥塞判断。
+    uint32_t             jitter_est_ = 0;
+    int64_t              last_arrival_ts_ = 0; ///< 上一包到达时的 RTP 时间戳
+    uint64_t             last_arrival_us_ = 0; ///< 上一包到达时的本地微秒单调钟
+    uint64_t             last_rr_send_us_ = 0; ///< 上一次发 RR 的时刻（wallclock_us）
+    uint32_t             our_ssrc_ = 0x41503200;  ///< "AP2\0"
 
     // ---- 抖动缓冲（唯一需要锁的部分）-----------------------------------------
     //   外部 flush() 会从其它线程清 buffer；内部 worker 每次收包 / 超时都要写；
