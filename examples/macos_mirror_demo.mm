@@ -587,10 +587,15 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         // 先把攒的 AAC 包解出来，避免 FLUSH 丢尾音
         DrainAacBatchLocked();
-        DrainLocked();
-        if (player_) [player_ stop];   // 清空已调度的缓冲
         pending_.clear();
         aac_batch_.clear();
+        // 清掉已调度的旧缓冲：AVAudioPlayerNode 的 stop() 会清空调度队列，
+        // 若仍处于播放状态则立即恢复 play——否则节点停死后即使继续
+        // scheduleBuffer 也不会出声（playing_ 仍为 true，on_play 不会再触发）。
+        if (player_) {
+            [player_ stop];
+            if (playing_) [player_ play];
+        }
     }
     void on_stop() override {
         std::lock_guard<std::mutex> lk(mu_);
