@@ -1066,11 +1066,11 @@ static void print_help(const char* argv0) {
 }
 
 int main(int argc, const char** argv) {
-    std::string name = "My Mac";
+    std::string name = "My Macss";
     uint16_t port = 7000;
     std::string pin;
     std::string keyfile;
-    std::string model = "MacBookPro18,3";  // 默认：电脑图标
+    std::string model = "AppleTV6,2";  // 默认：电脑图标
     bool audio_test = false;
 
     for (int i = 1; i < argc; ++i) {
