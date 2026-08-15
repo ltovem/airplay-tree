@@ -187,6 +187,22 @@ bool parse_plist(const std::string& data, PlistValue& out);
  */
 std::string serialize_xml_plist(const PlistValue& value);
 
+/*!
+ * @brief Base64 解码（标准字母表 + '=' 填充，跳过换行/空格）
+ * @param in  输入 base64 文本
+ * @param out 输出字节（清空后追加）
+ * @return true 成功（忽略非法字符；纯非法输入返回 true 但 out 为空）
+ */
+bool base64_decode(const std::string& in, std::vector<uint8_t>& out);
+
+/*!
+ * @brief Base64 编码
+ * @param data 输入字节
+ * @param len  字节数
+ * @return base64 字符串（标准 RFC 4648，无换行）
+ */
+std::string base64_encode(const uint8_t* data, size_t len);
+
 } // namespace util
 } // namespace airplay2
 

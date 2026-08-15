@@ -123,6 +123,8 @@ private:
     codec::AudioBuffer pcm_buffer_;
     AudioConfig audio_cfg_;
     std::string codec_mode_;
+    // AAC-ELD（屏幕镜像常用）：库不做内置解码，原始帧透传给渲染器
+    bool aac_compressed_ = false;
     std::atomic<bool> playing_{false};
     std::atomic<bool> video_playing_{false};
 

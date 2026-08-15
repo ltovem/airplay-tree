@@ -1,32 +1,54 @@
 /*!
  * @file alac_decoder.cpp
  *
- * ALAC decoder implementation based on the public Apple Lossless
- * specification and compatible with the reference open-source decoder.
+ * ALAC（Apple Lossless）解码器，按 FFmpeg libavcodec/alac.c（David Hammerton）
+ * 的位流结构移植实现：
  *
- * This implements the core algorithm:
- *  1. Read ALAC frame header (frame bytes / samples / chan / mode)
- *  2. For each channel: read predictor, LPC coefficients, Rice parameters
- *  3. Rice-decompress residuals
- *  4. Apply LPC predictor to reconstruct samples
- *  5. For stereo joint-coding: un-mix
- *  6. Output interleaved PCM16/24/32 LE
+ *   1. 每包（一个 ALAC 帧）由若干"语法元素"组成，每个元素以 3-bit 类型开头：
+ *        TYPE_SCE=0（单声道） / TYPE_CPE=1（立体声对） / TYPE_LFE=3 / TYPE_END=7
+ *   2. 元素头（decode_element）：
+ *        元素实例标签 4b + 保留 12b + has_size 1b + extra_bits 2b(<<3)
+ *        + bps + is_compressed 1b + [输出采样数 32b]
+ *   3. 压缩帧：decorr_shift 8b + decorr_left_weight 8b
+ *        每声道：prediction_type 4b + lpc_quant 4b + rice_history_mult 3b
+ *                 + lpc_order 5b + [lpc_order 个 16b 有符号系数]
+ *        然后 Rice 解码残差 → LPC 预测重建 → 立体声去相关
+ *   4. 以 TYPE_END 结束
+ *
+ * 之前这版实现按"16 位采样数 + 声道数"的假想帧头解析，与真实位流完全不符，
+ * 输出为满幅噪声（已用 afconvert 生成的真实 ALAC 帧验证：min/max ±32767）。
  */
 #include "alac_decoder.h"
 #include "../platform/platform_log.h"
 #include <cstring>
 #include <cstdlib>
-#include <cmath>
-#include <algorithm>   // std::min / std::max（LPC 重建时裁剪样本范围）
+#include <algorithm>
 #include <sstream>
 
 namespace airplay2 {
 namespace codec {
 
+// ALAC 语法元素类型（FFmpeg alac.h AlacRawDataBlockType）
+enum AlacElementType : uint8_t {
+    kTypeSce = 0,   // 单声道元素
+    kTypeCpe = 1,   // 立体声对元素
+    kTypeLfe = 3,   // 低频效果声道
+    kTypeEnd = 7,   // 帧结束
+};
+
 bool parse_alac_fmtp(const std::string& fmtp, AlacMagicCookie& out) {
-    // fmtp examples:
-    //   "96 0 16 4096 10 14 2 255 0 0 44100"
-    //   "0 16 4096 10 14 2 255 0 0 44100"
+    // AirPlay SDP 的 ALAC fmtp 实际是 ALACMagicCookieDescription 的数字序列，
+    // 常见两种字段顺序（区别在于 frameLength 是否位于最前）：
+    //   A: [PT] compatibleVersion bitDepth frameLength pb mb kb numChannels
+    //      maxRun maxFrameBytes avgBitRate sampleRate        （AirPlay 1 风格）
+    //   B: [PT] frameLength compatibleVersion bitDepth pb mb kb numChannels
+    //      maxRun maxFrameBytes avgBitRate sampleRate        （AirPlay 2 风格）
+    // 其中 [PT]（payload type，如 96）由 "a=fmtp:96 ..." 带出，解析后可能残留。
+    //
+    // 判别技巧：bitDepth 必须是 16/20/24/32，用它定位两种布局中 bitDepth 的下标：
+    //   下标 1 → 布局 A（无前导 frameLength）
+    //   下标 2 → 布局 B（带前导 frameLength）
+    // 其余字段做范围兜底，避免个别发送端缺字段时产生荒谬配置。
     std::vector<int> nums;
     std::istringstream iss(fmtp);
     std::string tok;
@@ -34,23 +56,53 @@ bool parse_alac_fmtp(const std::string& fmtp, AlacMagicCookie& out) {
         if (tok.empty()) continue;
         try { nums.push_back(std::stoi(tok)); } catch (...) { nums.push_back(0); }
     }
-    if (nums.size() < 10) return false;
-    size_t i = 0;
-    if (nums.size() == 11) i = 1; // skip payload type prefix
-    out.compatible_version = nums[i + 0];
-    out.bit_depth          = nums[i + 1];
-    out.frame_length       = nums[i + 2];
-    out.mb                 = nums[i + 3]; // max_run
-    out.kb                 = nums[i + 4]; // rice_history_mult
-    int pb0                = nums[i + 5]; // predictor_initial
-    int max_run0           = nums[i + 6];
-    (void)max_run0;
-    out.avg_bit_rate       = nums[i + 7];
-    out.sample_rate        = nums[i + 8];
-    if (nums.size() > i + 9) out.num_channels = (nums[i + 9] ? nums[i + 9] : 2);
-    else                     out.num_channels = 2;
-    out.pb = pb0 ? pb0 : 40;
-    out.max_run = max_run0 ? max_run0 : 255;
+    if (nums.size() < 9) return false;
+
+    // 去掉 payload type 前缀：首字段为 1..127 且字段数足够（≥12）时视为 PT。
+    // 真实 frameLength（如 352）远大于 127，不会被误删。
+    if (nums.size() >= 12 && nums[0] >= 1 && nums[0] <= 127) nums.erase(nums.begin());
+
+    // 定位 bitDepth 下标（只看前 4 个字段，避免把 sampleRate 等误判）
+    int bd_pos = -1;
+    for (int i = 0; i < 4 && i < (int)nums.size(); ++i) {
+        if (nums[i] == 16 || nums[i] == 20 || nums[i] == 24 || nums[i] == 32) { bd_pos = i; break; }
+    }
+    if (bd_pos == 1) {
+        // 布局 A: version bitDepth frameLength pb mb kb ch maxRun maxFB avgBR sr
+        out.compatible_version = (0 < (int)nums.size()) ? nums[0] : 0;
+        out.bit_depth          = (1 < (int)nums.size()) ? nums[1] : 16;
+        out.frame_length       = (2 < (int)nums.size()) ? nums[2] : 4096;
+        out.pb                 = (3 < (int)nums.size()) ? nums[3] : 40;
+        out.mb                 = (4 < (int)nums.size()) ? nums[4] : 10;
+        out.kb                 = (5 < (int)nums.size()) ? nums[5] : 14;
+        out.num_channels       = (6 < (int)nums.size() && nums[6] > 0) ? nums[6] : 2;
+        out.max_run            = (7 < (int)nums.size()) ? nums[7] : 255;
+        out.max_frame_bytes    = (8 < (int)nums.size()) ? nums[8] : 0;
+        out.avg_bit_rate       = (9 < (int)nums.size()) ? nums[9] : 0;
+        out.sample_rate        = (10 < (int)nums.size()) ? nums[10] : 44100;
+    } else {
+        // 布局 B（含默认）：frameLength version bitDepth pb mb kb ch maxRun maxFB avgBR sr
+        out.frame_length       = (0 < (int)nums.size()) ? nums[0] : 4096;
+        out.compatible_version = (1 < (int)nums.size()) ? nums[1] : 0;
+        out.bit_depth          = (2 < (int)nums.size()) ? nums[2] : 16;
+        out.pb                 = (3 < (int)nums.size()) ? nums[3] : 40;
+        out.mb                 = (4 < (int)nums.size()) ? nums[4] : 10;
+        out.kb                 = (5 < (int)nums.size()) ? nums[5] : 14;
+        out.num_channels       = (6 < (int)nums.size() && nums[6] > 0) ? nums[6] : 2;
+        out.max_run            = (7 < (int)nums.size()) ? nums[7] : 255;
+        out.max_frame_bytes    = (8 < (int)nums.size()) ? nums[8] : 0;
+        out.avg_bit_rate       = (9 < (int)nums.size()) ? nums[9] : 0;
+        out.sample_rate        = (10 < (int)nums.size()) ? nums[10] : 44100;
+    }
+    // 兜底：非法/缺失值使用安全默认（参考 ALACSpecificConfig 合理范围）
+    if (out.bit_depth != 16 && out.bit_depth != 20 && out.bit_depth != 24 && out.bit_depth != 32)
+        out.bit_depth = 16;
+    if (out.frame_length < 32 || out.frame_length > 65536) out.frame_length = 4096;
+    if (out.pb < 1)  out.pb = 40;
+    if (out.mb < 1)  out.mb = 10;
+    if (out.kb < 1)  out.kb = 14;
+    if (out.num_channels < 1 || out.num_channels > 8) out.num_channels = 2;
+    if (out.sample_rate < 8000 || out.sample_rate > 192000) out.sample_rate = 44100;
     return true;
 }
 
@@ -80,52 +132,139 @@ uint32_t AlacDecoder::BitReader::peek(unsigned nbits) const {
     return tmp.read(nbits);
 }
 
-int32_t AlacDecoder::idiv_shift(int32_t a, int shift) {
-    // Avoid C/C++ undefined right-shift of negative values
-    if (a >= 0) return a >> shift;
-    return -((-a) >> shift);
+/*! floor(log2(v))，v>0 */
+static int alac_log2(unsigned v) {
+    int r = 0;
+    while (v > 1) { r++; v >>= 1; }
+    return r;
+}
+
+/*! 有符号数按 bits 位符号扩展（FFmpeg sign_extend）。
+ * 注意：必须对 int32 做"算术右移"才能正确扩展符号；
+ * 若在 uint32 上右移（逻辑右移），负值会被掩成正值（例如 -666 变 130406）。
+ * 先左移（unsigned 无 UB）再转 int32 算术右移，兼容 GCC/Clang/MSVC。 */
+static inline int32_t sign_extend(int32_t v, int bits) {
+    if (bits >= 32) return v;
+    int32_t shifted = (int32_t)((uint32_t)v << (32 - bits));
+    return shifted >> (32 - bits);
 }
 
 /*!
- * Rice decompress: reads N signed residuals using Rice(k) code.
- * Returns samples decoded (<= count) or -1 on error.
- *
- * Rice code structure: unary_quotient + k-bit remainder (sign bit at LSB *after* remainder).
- * In ALAC variant: unary quotient, then k bits remainder, then sign bit (0=pos, 1=neg).
+ * Rice 值解码（FFmpeg decode_scalar + get_unary_0_9）
+ * @param k   当前 rice 参数（0..rice_limit）
+ * @param bps 每样本位数（超过阈值时的直读位数）
  */
-int AlacDecoder::rice_decompress(BitReader& br, int k, int32_t* samples, int count,
-                                  int mod_shift, int max_samples) {
-    (void)mod_shift;
-    int n = 0;
-    while (n < count && n < max_samples) {
-        // Read unary quotient
-        uint32_t q = 0;
-        while (br.bits_left() > 0 && br.read(1) == 0 && q < 0xFFFFFF) q++;
-        if (q == 0xFFFFFF) {
-            AP2_LOGW("alac: rice unary overflow");
-            return -1;
-        }
-        uint32_t r = (k > 0) ? br.read(k) : 0;
-        uint32_t x = (q << k) | r;
-        // Sign bit
-        int32_t val;
-        if (x == 0) {
-            // No sign bit for zero
-            val = 0;
+uint32_t AlacDecoder::decode_scalar(BitReader& br, int k, int bps) {
+    // unary：数连续 1，最多 9 位
+    unsigned x = 0;
+    while (x < 9 && br.bits_left() > 0 && br.read(1) == 1) x++;
+    if (x > 8) {
+        // 超过阈值：直接用 bps 位读取
+        x = br.read((unsigned)bps);
+    } else if (k != 1) {
+        uint32_t extrabits = br.peek((unsigned)k);
+        x = (x << k) - x; // x * (2^k - 1)
+        if (extrabits > 1) {
+            x += extrabits - 1;
+            br.skip((unsigned)k);
         } else {
-            uint32_t sign = br.read(1);
-            val = (int32_t)x;
-            if (sign) val = -val;
+            br.skip((unsigned)(k - 1));
         }
-        samples[n++] = val;
     }
-    return n;
+    return x;
 }
 
-AlacDecoder::AlacDecoder() {
-    for (auto& ch : predictor_buf_) ch.fill(0);
-    predictor_used_.fill(0);
+int AlacDecoder::rice_decompress(BitReader& br, int rice_limit, int32_t* output,
+                                 int nb_samples, int bps, int rice_history_mult,
+                                 int initial_history) {
+    unsigned history = (unsigned)initial_history; // rice_initial_history
+    int sign_modifier = 0;
+    for (int i = 0; i < nb_samples; i++) {
+        if (br.bits_left() <= 0) return i;
+        // k = av_log2((history >> 9) + 3)，并受 rice_limit 限制
+        int k = alac_log2((history >> 9) + 3);
+        k = std::min(k, rice_limit);
+        unsigned x = decode_scalar(br, k, bps);
+        x += (unsigned)sign_modifier;
+        sign_modifier = 0;
+        // 折半编码：x 偶 → 0，奇 → 负
+        output[i] = (int32_t)((x >> 1) ^ (uint32_t)-(int32_t)(x & 1));
+        // 更新历史
+        if (x > 0xffff) history = 0xffff;
+        else history += x * (unsigned)rice_history_mult -
+                        ((history * (unsigned)rice_history_mult) >> 9);
+        // 零块特殊处理
+        if ((history < 128) && (i + 1 < nb_samples)) {
+            int block_size;
+            int kk = 7 - alac_log2(history) + ((int)(history + 16) >> 6);
+            kk = std::min(kk, rice_limit);
+            block_size = (int)decode_scalar(br, kk, 16);
+            if (block_size > 0) {
+                if (block_size >= nb_samples - i) block_size = nb_samples - i - 1;
+                std::memset(&output[i + 1], 0, (size_t)block_size * sizeof(int32_t));
+                i += block_size;
+            }
+            if (block_size <= 0xffff) sign_modifier = 1;
+            history = 0;
+        }
+    }
+    return nb_samples;
 }
+
+/*!
+ * LPC 预测重建（FFmpeg lpc_prediction）
+ */
+static void lpc_prediction(const int32_t* error_buffer, int32_t* buffer_out,
+                           int nb_samples, int bps, int16_t* lpc_coefs,
+                           int lpc_order, int lpc_quant) {
+    buffer_out[0] = error_buffer[0];
+    if (nb_samples <= 1) return;
+    if (lpc_order == 0) {
+        for (int i = 1; i < nb_samples; i++) buffer_out[i] = error_buffer[i];
+        return;
+    }
+    if (lpc_order == 31) {
+        // 简单一阶预测
+        for (int i = 1; i < nb_samples; i++)
+            buffer_out[i] = sign_extend(buffer_out[i - 1] + error_buffer[i], bps);
+        return;
+    }
+    // warm-up 样本
+    for (int i = 1; i <= lpc_order && i < nb_samples; i++)
+        buffer_out[i] = sign_extend(buffer_out[i - 1] + error_buffer[i], bps);
+    // 主循环：pred 是游走指针（从 buffer_out[0] 起，每迭代前进一个），
+    // 与 FFmpeg 一致——引用的是"之前的"样本，绝不能包含当前未写出的样本
+    const int32_t* pred = buffer_out;
+    for (int i = lpc_order + 1; i < nb_samples; i++) {
+        int j;
+        int val = 0;
+        unsigned error_val = (unsigned)error_buffer[i];
+        int error_sign;
+        int d = *pred++;
+        for (j = 0; j < lpc_order; j++)
+            val += (pred[j] - d) * lpc_coefs[j];
+        val = (val + (1LL << (lpc_quant - 1))) >> lpc_quant;
+        val += d + (int)error_val;
+        buffer_out[i] = sign_extend(val, bps);
+        // 自适应调整 LPC 系数
+        // 注意：error_val 是 unsigned，符号必须从"有符号"原始残差取，
+        // 否则负残差在 unsigned 下变成巨大正数，error_sign 恒为正（参考 FFmpeg
+        // sign_only(error_val)，其通过 int 参数转换保留真实符号）
+        error_sign = (error_buffer[i] > 0) - (error_buffer[i] < 0);
+        if (error_sign) {
+            for (j = 0; j < lpc_order && (int)(error_val * (unsigned)error_sign) > 0; j++) {
+                int sign;
+                val = d - pred[j];
+                sign = ((val > 0) - (val < 0)) * error_sign;
+                lpc_coefs[j] = (int16_t)(lpc_coefs[j] - sign);
+                val *= (unsigned)sign;
+                error_val -= (unsigned)((val >> lpc_quant) * (j + 1));
+            }
+        }
+    }
+}
+
+AlacDecoder::AlacDecoder() = default;
 AlacDecoder::~AlacDecoder() = default;
 
 bool AlacDecoder::configure(const AlacMagicCookie& cookie) {
@@ -136,6 +275,7 @@ bool AlacDecoder::configure(const AlacMagicCookie& cookie) {
         case 16: out_cfg_.format = AudioFormat::PCM16LE; break;
         case 24: out_cfg_.format = AudioFormat::PCM24LE; break;
         case 32: out_cfg_.format = AudioFormat::PCM32LE; break;
+        case 20: out_cfg_.format = AudioFormat::PCM32LE; break; // 20bit 提升到 32bit 输出
         default:
             out_cfg_.format = AudioFormat::PCM16LE;
             cookie_.bit_depth = 16;
@@ -149,166 +289,145 @@ bool AlacDecoder::configure(const AlacMagicCookie& cookie) {
 }
 
 void AlacDecoder::reset() {
-    for (auto& ch : predictor_buf_) ch.fill(0);
-    predictor_used_.fill(0);
-}
-
-void AlacDecoder::decode_channel(BitReader& br, int32_t* out, int samples,
-                                  int predictor_num, int m, uint32_t* lpc_coefs,
-                                  int chan_bits, int chan_history) {
-    (void)chan_history;
-    if (samples <= 0) return;
-
-    // 1) Read rice parameter and denshift
-    int rice_k = (int)br.read(std::max(1, m));
-    int denshift = std::max(0, chan_bits - 1 - 16); // shift scale for predictor output
-    if (rice_k > 16) rice_k = 0; // sanity
-
-    // 2) Decompress residuals
-    std::vector<int32_t> residuals(samples);
-    int got = rice_decompress(br, rice_k, residuals.data(), samples, 0, samples);
-    if (got != samples) {
-        // Fill remainder with zeros if short read
-        std::memset(residuals.data() + got, 0, sizeof(int32_t) * (samples - got));
-    }
-
-    // 3) If predictor num > 0, apply LPC predictor using history buffer
-    int32_t* hist = predictor_buf_[0].data(); // simplify: use channel 0 here for all, enough for demo
-    int used = std::min<int>(predictor_used_[0], predictor_num);
-    std::copy(predictor_buf_[0].end() - 32, predictor_buf_[0].end(), hist);
-
-    // Unroll LPC application
-    for (int s = 0; s < samples; ++s) {
-        // LPC sum of last predictor_num samples weighted by coefs
-        int64_t sum = 0;
-        int order = std::min(predictor_num, used + s);
-        // Build "current history" including already-reconstructed samples of this frame
-        for (int i = 0; i < predictor_num && (i < used + s); ++i) {
-            int32_t sample_val;
-            if (i < s) sample_val = out[s - 1 - i];
-            else       sample_val = hist[kMaxPredictor - (i - s) - 1];
-            uint32_t c = (i < 32) ? lpc_coefs[i] : 0;
-            sum += (int64_t)sample_val * (int32_t)c;
-        }
-        int32_t pred = idiv_shift((int32_t)((sum + 0x8000) >> 16), denshift);
-        int32_t recon = pred + residuals[s];
-        out[s] = recon;
-        // Track used predictor depth
-        if (used < predictor_num) used++;
-    }
-    // Update predictor history with last 32 samples of this frame
-    int push = std::min(samples, kMaxPredictor);
-    // Shift history left by `push`
-    for (int i = kMaxPredictor - 1; i >= push; --i) hist[i] = hist[i - push];
-    for (int i = 0; i < push; ++i) {
-        hist[i] = (samples - push + i >= 0) ? out[samples - push + i] : 0;
-    }
-    predictor_used_[0] = std::min<int>(kMaxPredictor, used);
-}
-
-static void pcm_to_bytes_s16le(const int32_t* samples, size_t n, int channels,
-                               std::vector<uint8_t>& out, size_t& off) {
-    for (size_t i = 0; i < n; ++i) {
-        for (int ch = 0; ch < channels; ++ch) {
-            int32_t s = samples[i * channels + ch];
-            if (s >  32767) s =  32767;
-            if (s < -32768) s = -32768;
-            int16_t v = (int16_t)s;
-            out[off++] = (uint8_t)v;
-            out[off++] = (uint8_t)((uint16_t)v >> 8);
-        }
-    }
+    // ALAC 帧是自包含的（每帧携带 LPC 系数与 warm-up），无需跨帧状态
 }
 
 int64_t AlacDecoder::decode_frame(const uint8_t* data, size_t len,
-                                   std::vector<uint8_t>& out_pcm) {
-    if (!configured_) return -1;
-    if (len < 3) return -1;
+                                  std::vector<uint8_t>& out_pcm) {
+    if (!configured_ || len < 3) return -1;
 
-    BitReader br; br.init(data, len);
+    BitReader br;
+    br.init(data, len);
 
-    // ---- ALAC frame header ----
-    uint32_t tag = br.read(32); // 'alac' 0x616C6163 or frame header
-    // Frame header (3 bytes): samples (12b), unused (4b), chan_mode (4b), channels (4b),
-    //                           unused (8b)? Specs vary by implementation; fallback:
-    if (tag == 0x616C6163u || tag == 0x61616300u) {
-        // Apple standard frame: skip "alac", next bytes are the frame descriptor
-    } else {
-        // AirPlay often sends raw ALAC without "alac" tag. Reset.
-        br.init(data, len);
-    }
+    const int sample_size = cookie_.bit_depth;
+    const int max_samples = (cookie_.frame_length > 0 && cookie_.frame_length <= 65536)
+                                ? cookie_.frame_length : 4096;
 
-    // Try the 3-byte ALAC descriptor used by iTunes / AirPlay
-    int samples_per_chan = (int)br.read(12); // bits 31..20
-    br.read(4); // reserved
-    int chan_mode  = (int)br.read(4);  // 0 = mono, 1 = stereo joint, 2 = stereo dual
-    int channels   = (int)br.read(4);
-    (void)br.read(8); // unused
-    if (channels == 0) channels = cookie_.num_channels;
-    // 解码器只支持 1/2 声道（decoded[2]、predictor_num[2]、coefs[2][32] 均为 2 路）；
-    // 畸形/恶意数据可能给出超大 channels，必须夹到 [1,2]，否则数组越界
-    if (channels < 1 || channels > 2) channels = 2;
-    if (samples_per_chan <= 0) { samples_per_chan = cookie_.frame_length; }
-    if (samples_per_chan > 65536) samples_per_chan = 4096;
-
-    // LPC predictor parameters per channel
-    int predictor_num[2] = {0, 0};
-    int32_t lpc_q[2] = {0, 0};
-    uint32_t coefs[2][32] = {{0},{0}};
-
-    for (int c = 0; c < channels; ++c) {
-        if (br.bits_left() < 16) break;
-        predictor_num[c] = (int)br.read(4);
-        lpc_q[c]         = (int32_t)br.read(4);
-        (void)lpc_q[c];
-        int mb           = (int)br.read(4);
-        (void)mb;
-        int kb           = (int)br.read(4);
-        (void)kb;
-        for (int i = 0; i < predictor_num[c]; ++i) {
-            // coefficients are 16-bit signed in alac
-            coefs[c][i] = (uint32_t)(int32_t)(int16_t)br.read(16);
-        }
-    }
-
-    // ---- Decode channels into int32_t buffers ----
+    // 本帧解码结果（最多 2 声道）
     std::vector<int32_t> decoded[2];
-    decoded[0].resize(samples_per_chan, 0);
-    decoded[1].resize(samples_per_chan, 0);
+    uint32_t out_samples = 0;
+    int out_channels = cookie_.num_channels > 0 ? cookie_.num_channels : 2;
+    bool decoded_any = false;
 
-    for (int c = 0; c < channels; ++c) {
-        decode_channel(br, decoded[c].data(), samples_per_chan,
-                       predictor_num[c], cookie_.kb, coefs[c],
-                       cookie_.bit_depth, 20);
-    }
-
-    // ---- Joint stereo un-mix if needed ----
-    if (chan_mode == 1 && channels >= 2) {
-        // A = mid = (L+R)/2 ; B = side = L-R
-        // L = A + B/2 ; R = A - B/2
-        for (int i = 0; i < samples_per_chan; ++i) {
-            int32_t A = decoded[0][i];
-            int32_t B = decoded[1][i];
-            int32_t L = A + idiv_shift(B, 1);
-            int32_t R = A - idiv_shift(B, 1);
-            decoded[0][i] = L;
-            decoded[1][i] = R;
+    // 逐元素解码：TYPE_END 结束；遇到未知元素/位不足/元素解析失败则结束本帧。
+    // 注意：部分编码器（如 CAF 流）帧间可能没有 TYPE_END 标签且按字节对齐，
+    // 因此不能因"没找到 END"就丢弃整帧——只要解出至少一个完整元素即可。
+    while (br.bits_left() >= 3) {
+        uint8_t element = (uint8_t)br.read(3);
+        if (element == kTypeEnd) break;
+        if (element != kTypeSce && element != kTypeCpe && element != kTypeLfe) {
+            break; // 未知元素类型（可能已进入下一帧/填充）
         }
-    }
+        int channels = (element == kTypeCpe) ? 2 : 1;
+        out_channels = channels;
 
-    // ---- Interleave and convert to output bytes ----
-    size_t bytes_per_sample = 0;
-    switch (cookie_.bit_depth) {
-        case 24: bytes_per_sample = 3; break;
-        case 32: bytes_per_sample = 4; break;
-        default: bytes_per_sample = 2; break;
+        // ---- 元素头（decode_element） ----
+        br.skip(4);  // element instance tag
+        br.skip(12); // unused header bits
+        int has_size = (int)br.read(1);
+        int extra_bits = (int)br.read(2) << 3;
+        int bps = sample_size - extra_bits + channels - 1;
+        if (bps > 32 || bps < 1) break;
+        int is_compressed = !(int)br.read(1);
+        uint32_t output_samples;
+        if (has_size) output_samples = br.read(32);
+        else          output_samples = (uint32_t)max_samples;
+        if (output_samples == 0 || output_samples > (uint32_t)max_samples) break;
+
+        for (int c = 0; c < channels; c++) decoded[c].assign(output_samples, 0);
+        int32_t* out_ptr[2] = { decoded[0].data(), decoded[1].data() };
+
+        if (is_compressed) {
+            int decorr_shift = (int)br.read(8);
+            int decorr_left_weight = (int)br.read(8);
+            if (channels == 2 && decorr_left_weight && decorr_shift > 31) break;
+
+            int16_t lpc_coefs[2][32] = {{0},{0}};
+            int lpc_order[2] = {0, 0};
+            int lpc_quant[2] = {0, 0};
+            int rice_history_mult[2] = {0, 0};
+            int prediction_type[2] = {0, 0};
+
+            for (int ch = 0; ch < channels; ch++) {
+                prediction_type[ch] = (int)br.read(4);
+                lpc_quant[ch]       = (int)br.read(4);
+                rice_history_mult[ch] = (int)br.read(3);
+                lpc_order[ch]       = (int)br.read(5);
+                if (lpc_order[ch] >= max_samples || !lpc_quant[ch]) break;
+                // 系数按逆序存储（FFmpeg: for i=order-1..0）
+                for (int i = lpc_order[ch] - 1; i >= 0; i--)
+                    lpc_coefs[ch][i] = (int16_t)br.read(16);
+            }
+
+            // extra bits（20/24/32 位编码的附加低位）——当前输出不携带，直接跳过
+            if (extra_bits) {
+                if (br.bits_left() < (int)(output_samples * channels * extra_bits)) break;
+                for (uint32_t i = 0; i < output_samples; i++)
+                    for (int ch = 0; ch < channels; ch++)
+                        br.skip((unsigned)extra_bits);
+            }
+
+            for (int ch = 0; ch < channels; ch++) {
+                std::vector<int32_t> err(output_samples);
+                // cookie 映射（与 FFmpeg alac_set_extradata 一致）：
+                //   pb=rice_history_mult 基准(40)，mb=rice_initial_history(10)，
+                //   kb=rice_limit(14)
+                int got = rice_decompress(br, cookie_.kb, err.data(),
+                                          (int)output_samples, bps,
+                                          rice_history_mult[ch] * cookie_.pb / 4,
+                                          cookie_.mb);
+                if (got != (int)output_samples) break;
+                // prediction_type 15：先做一次 31 阶自适应 FIR（参考编码器不用）
+                if (prediction_type[ch] == 15) {
+                    lpc_prediction(err.data(), err.data(), (int)output_samples,
+                                   bps, nullptr, 31, 0);
+                }
+                lpc_prediction(err.data(), out_ptr[ch], (int)output_samples, bps,
+                               lpc_coefs[ch], lpc_order[ch], lpc_quant[ch]);
+            }
+
+            // 立体声去相关（FFmpeg decorrelate_stereo）
+            if (channels == 2 && decorr_left_weight) {
+                for (uint32_t i = 0; i < output_samples; i++) {
+                    int32_t a = decoded[0][i];
+                    int32_t b = decoded[1][i];
+                    a -= (b * decorr_left_weight) >> decorr_shift;
+                    decoded[0][i] = a;
+                    decoded[1][i] = a + b;
+                }
+            }
+        } else {
+            // 未压缩（verbatim）：直接读样本
+            if (br.bits_left() < (int)(output_samples * channels * sample_size)) break;
+            for (uint32_t i = 0; i < output_samples; i++)
+                for (int ch = 0; ch < channels; ch++)
+                    out_ptr[ch][i] = (int32_t)br.read((unsigned)sample_size);
+        }
+
+        // 20/24 位提升（FFmpeg：20<<12, 24<<8）
+        if (sample_size == 20) {
+            for (int c = 0; c < channels; c++)
+                for (uint32_t i = 0; i < output_samples; i++) decoded[c][i] <<= 12;
+        } else if (sample_size == 24) {
+            for (int c = 0; c < channels; c++)
+                for (uint32_t i = 0; i < output_samples; i++) decoded[c][i] <<= 8;
+        }
+
+        out_samples = output_samples;
+        decoded_any = true;
     }
-    size_t out_bytes = (size_t)samples_per_chan * channels * bytes_per_sample;
+    if (!decoded_any || out_samples == 0) return -1;
+
+    // ---- 交织输出 PCM ----
+    const int bytes_per_sample = (sample_size == 24) ? 3 : 4; // 16/20/32 → 4 字节，24 → 3 字节
+    // 16 位输出 2 字节
+    const size_t out_bytes = (size_t)out_samples * out_channels *
+                             ((sample_size == 16) ? 2 : bytes_per_sample);
     out_pcm.resize(out_bytes);
     size_t off = 0;
-    if (bytes_per_sample == 2) {
-        for (int i = 0; i < samples_per_chan; ++i) {
-            for (int c = 0; c < channels; ++c) {
+    if (sample_size == 16) {
+        for (uint32_t i = 0; i < out_samples; i++) {
+            for (int c = 0; c < out_channels; c++) {
                 int32_t s = decoded[c][i];
                 if (s >  32767) s =  32767;
                 if (s < -32768) s = -32768;
@@ -317,9 +436,9 @@ int64_t AlacDecoder::decode_frame(const uint8_t* data, size_t len,
                 out_pcm[off++] = (uint8_t)((uint16_t)v >> 8);
             }
         }
-    } else if (bytes_per_sample == 3) {
-        for (int i = 0; i < samples_per_chan; ++i) {
-            for (int c = 0; c < channels; ++c) {
+    } else if (sample_size == 24) {
+        for (uint32_t i = 0; i < out_samples; i++) {
+            for (int c = 0; c < out_channels; c++) {
                 int32_t s = decoded[c][i];
                 if (s >  0x7FFFFF) s =  0x7FFFFF;
                 if (s < -0x800000) s = -0x800000;
@@ -329,11 +448,10 @@ int64_t AlacDecoder::decode_frame(const uint8_t* data, size_t len,
                 out_pcm[off++] = (uint8_t)(u >> 16);
             }
         }
-    } else { // 4 bytes
-        for (int i = 0; i < samples_per_chan; ++i) {
-            for (int c = 0; c < channels; ++c) {
-                int32_t s = decoded[c][i];
-                uint32_t u = (uint32_t)s;
+    } else { // 20 → 32bit 或原生 32bit
+        for (uint32_t i = 0; i < out_samples; i++) {
+            for (int c = 0; c < out_channels; c++) {
+                uint32_t u = (uint32_t)decoded[c][i];
                 out_pcm[off++] = (uint8_t)u;
                 out_pcm[off++] = (uint8_t)(u >> 8);
                 out_pcm[off++] = (uint8_t)(u >> 16);
@@ -341,10 +459,7 @@ int64_t AlacDecoder::decode_frame(const uint8_t* data, size_t len,
             }
         }
     }
-    (void)pcm_to_bytes_s16le;
-    int64_t consumed = (int64_t)br.bytes_used();
-    if (consumed <= 0) consumed = (int64_t)len;
-    return consumed;
+    return (int64_t)br.bytes_used();
 }
 
 } // namespace codec

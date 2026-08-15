@@ -142,12 +142,13 @@ static int base64_char_to_val(char c) {
 }
 
 /*!
- * @brief Base64 解码 —— 用于 plist <data> 标签
+ * @brief Base64 解码 —— 用于 plist <data> 标签 / SDP sprop-parameter-sets
  *
  * AirPlay /info 里没用到 <data>，但设备发送的某些 /action /event
- * 里有。这是一个标准的 4 字符 → 3 字节解码器。
+ * 里有；H.264 的 SPS/PPS 也会以 base64 形式出现在 SDP fmtp 中。
+ * 这是一个标准的 4 字符 → 3 字节解码器。
  */
-static bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
+bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
     out.clear();
     uint8_t block[3];
     int val[4];
@@ -178,7 +179,7 @@ static bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
     return true;
 }
 
-static std::string base64_encode(const uint8_t* data, size_t len) {
+std::string base64_encode(const uint8_t* data, size_t len) {
     std::string out;
     out.reserve(((len + 2) / 3) * 4);
     size_t i = 0;
