@@ -148,6 +148,10 @@ void HttpServer::accept_worker() {
         }
         AP2_LOGI("http: connection %lu from %s", (unsigned long)id, addr.to_string().c_str());
         // Detached worker thread per connection
+        // self_delete=true：线程体内 delete 自己（先 detach 再 delete，见
+        // platform_thread.h start() 注释）。必须显式声明，否则线程包装函数
+        // 在 f() 返回后还会访问已释放的 running_ → use-after-free → 堆破坏
+        // （Xcode Debug 下 malloc 直接报 heap corruption 崩溃）。
         platform::Thread* t = new platform::Thread();
         std::weak_ptr<Connection> wconn = conn;
         HttpServer* self = this;
@@ -157,7 +161,7 @@ void HttpServer::accept_worker() {
             t->detach();
             if (auto c = wconn.lock()) self->connection_worker(c);
             delete t;
-        }, "ap2-http-conn");
+        }, "ap2-http-conn", true);
     }
 }
 

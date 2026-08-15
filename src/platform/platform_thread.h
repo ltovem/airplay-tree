@@ -31,7 +31,10 @@ public:
     Thread& operator=(const Thread&) = delete;
 
     /// Start the thread. Returns false if already running.
-    bool start(Func func, const std::string& name = "");
+    /// @param self_delete true = 线程体内会 delete 本 Thread 对象（自管理生命周期，
+    ///        如每连接一线程）。此时线程包装函数在 f() 返回后**不能再访问 this**，
+    ///        running_ 的清理交给 f() 里的 delete（析构已 request_stop）。
+    bool start(Func func, const std::string& name = "", bool self_delete = false);
 
     /// Request stop via atomic flag (cooperative; function must check it)
     void request_stop() { running_.store(false); }

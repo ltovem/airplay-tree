@@ -40,12 +40,12 @@ static void set_current_thread_name(const std::string& name) {
 #endif
 }
 
-bool Thread::start(Func func, const std::string& name) {
+bool Thread::start(Func func, const std::string& name, bool self_delete) {
     if (impl_ && impl_->t.joinable()) return false;
     impl_ = std::make_unique<Impl>();
     impl_->owner = this;
     running_.store(true);
-    impl_->t = std::thread([this, f = std::move(func), name]() {
+    impl_->t = std::thread([this, f = std::move(func), name, self_delete]() {
         g_current_thread = this;
         set_current_thread_name(name);
         try {
@@ -53,7 +53,10 @@ bool Thread::start(Func func, const std::string& name) {
         } catch (...) {
             // swallow; user function should handle
         }
-        running_.store(false);
+        // 自删除模式下 f() 已 delete this（析构里 request_stop 置位了 running_），
+        // 这里**绝不能**再访问 this->running_，否则 use-after-free → 堆破坏。
+        // 只清理线程局部指针（它指向的 Thread 对象可能已释放，但赋 nullptr 本身安全）。
+        if (!self_delete) running_.store(false);
         g_current_thread = nullptr;
     });
     return true;
