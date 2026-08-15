@@ -130,6 +130,13 @@ if(AIRPLAY2_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
+# 单元测试 —— 仅在能运行宿主二进制的平台开启（排除 iOS/Android/cross）
+option(AIRPLAY2_BUILD_TESTS "Build unit tests" ON)
+if(AIRPLAY2_BUILD_TESTS AND NOT AP2_IOS AND NOT AP2_ANDROID AND NOT CMAKE_CROSSCOMPILING)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
 # 安装配置
 install(TARGETS airplay2
     EXPORT airplay2Targets

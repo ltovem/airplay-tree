@@ -110,6 +110,7 @@ private:
     bool   body_is_chunked_ = false; // Transfer-Encoding 模式
     size_t chunk_left_ = 0;      // 当前 chunk 剩余字节
     size_t header_so_far_ = 0;
+    bool   skip_next_lf_ = false;///< 上一个状态单独吃了 '\r'，下一个状态开头需跳过 '\n'
     std::string cur_header_name_;
     std::string cur_header_value_;
     std::string line_buffer_;

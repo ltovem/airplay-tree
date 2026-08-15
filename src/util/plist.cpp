@@ -79,7 +79,6 @@ bool PlistValue::as_bool() const {
     if (type_ == PlistType::BOOL) return bool_;
     if (type_ == PlistType::INT) return int_ != 0;
     if (type_ == PlistType::REAL) return real_ != 0.0;
-    if (type_ == PlistType::STRING) return !str_.empty();
     return false;
 }
 const std::vector<uint8_t>& PlistValue::as_data() const {
@@ -647,7 +646,8 @@ bool parse_binary_plist(const uint8_t* data, size_t len, PlistValue& out) {
     if (num_objects > (1ULL << 24)) return false; // 太大，拒绝
 
     if (offset_table_off + num_objects * offset_size > len) return false;
-    if (offset_size == 0 || ref_size == 0) return false;
+    if (offset_size == 0) return false;
+    // ref_size == 0 合法（所有容器都为空，没有任何引用要读）
     if ((size_t)top_object >= num_objects) return false;
 
     std::vector<PlistValue> table(num_objects);  // 全部是 NONE

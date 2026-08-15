@@ -10,7 +10,7 @@ namespace airplay2 {
 
 bool AirPlayPairing::is_paired(const std::string& client_ip) const {
     std::lock_guard<std::mutex> lk(mu_);
-    if (pin_.empty()) return true; // no auth required
+    // 只查白名单；是否"无需认证"由上层结合 pin_code.empty() / fp_complete 判断
     auto it = paired_ips_.find(client_ip);
     return it != paired_ips_.end() && it->second;
 }

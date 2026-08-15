@@ -60,7 +60,17 @@ static inline std::string trim_space(const std::string& s) {
 
 size_t HttpRequestParser::parse(const uint8_t* data, size_t len) {
     size_t consumed = 0;
-    while (consumed < len && state_ != S_COMPLETE && state_ != S_ERROR) {
+    // 跨增量喂入的 CRLF 处理：上一次单独吃 '\r'，本次开头 '\n' 要先跳过
+    // 注意：即使 state_ 已 COMPLETE/ERROR，也要跳，否则背靠背 (back-to-back) 请求
+    // 会在下一次 parse 开头留一个孤立 '\n'。
+    if (skip_next_lf_ && len > 0 && data[0] == '\n') {
+        consumed = 1;
+        skip_next_lf_ = false;
+    }
+    // 注意：S_HEADERS_DONE 状态会不消耗字节，但需要切换到 BODY/COMPLETE/CHUNK_*，
+    //       所以即便 consumed >= len 也要再跑一次（避免停在中间状态）。
+    while (state_ != S_COMPLETE && state_ != S_ERROR &&
+           (consumed < len || state_ == S_HEADERS_DONE)) {
         switch (state_) {
             case S_METHOD: case S_URI: case S_PROTO: {
                 // Read up to SP / CRLF
@@ -98,7 +108,10 @@ size_t HttpRequestParser::parse(const uint8_t* data, size_t len) {
                         line_buffer_.clear();
                         state_ = S_HEADER_NAME;
                         ++consumed; // skip \r or \n
-                        if (term == '\r' && consumed < len && data[consumed] == '\n') ++consumed;
+                        if (term == '\r') {
+                            if (consumed < len && data[consumed] == '\n') ++consumed;
+                            else skip_next_lf_ = true;   // 等下次 parse 开头再跳
+                        }
                     } else {
                         state_ = S_ERROR;
                         return consumed;
@@ -128,11 +141,15 @@ size_t HttpRequestParser::parse(const uint8_t* data, size_t len) {
                     state_ = S_HEADER_VALUE;
                     ++consumed;
                 } else if (t == '\r' || t == '\n') {
-                    // Empty header line = headers done
+                    // 空行 = headers done. 之前 skip_next_lf_ 已经在 parse 开头处理了遗留 '\n'，
+                    // 这里只要 line_buffer 为空 → 空分隔行，不管之前有无 header 条目
                     line_buffer_.clear();
                     state_ = S_HEADERS_DONE;
                     ++consumed;
-                    if (t == '\r' && consumed < len && data[consumed] == '\n') ++consumed;
+                    if (t == '\r') {
+                        if (consumed < len && data[consumed] == '\n') ++consumed;
+                        else skip_next_lf_ = true;
+                    }
                 } else {
                     state_ = S_ERROR; return consumed;
                 }
@@ -159,7 +176,10 @@ size_t HttpRequestParser::parse(const uint8_t* data, size_t len) {
                 state_ = S_HEADER_NAME;
                 // skip \r\n
                 uint8_t t = data[consumed++];
-                if (t == '\r' && consumed < len && data[consumed] == '\n') ++consumed;
+                if (t == '\r') {
+                    if (consumed < len && data[consumed] == '\n') ++consumed;
+                    else skip_next_lf_ = true;
+                }
                 break;
             }
             case S_HEADERS_DONE: {
@@ -179,7 +199,9 @@ size_t HttpRequestParser::parse(const uint8_t* data, size_t len) {
                     req_.body.reserve(body_expected_);
                     state_ = S_BODY;
                 }
-                break;
+                // 这个状态不消费任何字节；直接 continue，进入下一轮 while 处理新状态，
+                // 否则外层 while 会因为 consumed==len 跳出导致停在 S_HEADERS_DONE。
+                continue;
             }
             case S_BODY: {
                 size_t need = body_expected_ - req_.body.size();
@@ -329,6 +351,7 @@ HttpRequest HttpRequestParser::take_request() {
     body_is_chunked_ = false;
     chunk_left_ = 0;
     header_so_far_ = 0;
+    skip_next_lf_ = false;
     line_buffer_.clear();
     cur_header_name_.clear();
     cur_header_value_.clear();

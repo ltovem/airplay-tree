@@ -56,6 +56,8 @@ bool fp_tlv_decode(const uint8_t* data, size_t len, std::vector<TlvItem>& out) {
         p += l;
         out.push_back(std::move(it));
     }
+    // 末尾残留字节（长度小于 header）：视为坏包
+    if (p != len) return false;
     return true;
 }
 

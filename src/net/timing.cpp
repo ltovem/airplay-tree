@@ -26,9 +26,9 @@ static constexpr uint64_t kNtpUnixOffset = 2208988800ULL;
 static constexpr uint8_t kTimingPtRequest  = 0x53; ///< timing request
 static constexpr uint8_t kTimingPtResponse = 0x54; ///< timing response
 
-// 固定包长：4B header + 4B SSRC + 3 * 4B timestamp = 24 字节
-// length 字段 = (24 - 4) / 4 = 4 个 32-bit word
-static constexpr size_t kTimingPacketLen = 24;
+// 固定包长：4B header + 4B SSRC + 3 * 4B timestamp = 20 字节
+// length 字段 = (20 - 4) / 4 = 4 个 32-bit word
+static constexpr size_t kTimingPacketLen = 20;
 
 TimingHandler::TimingHandler() = default;
 TimingHandler::~TimingHandler() = default;

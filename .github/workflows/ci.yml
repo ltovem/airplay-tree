@@ -95,6 +95,35 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: cmake --install build --config ${{ matrix.build_type }} || true
 
+      # 单元测试 —— 桌面三平台原生构建才运行
+      # AIRPLAY2_BUILD_TESTS 默认 ON，但交叉/移动端由 CMakeLists.txt 里 CMAKE_CROSSCOMPILING / AP2_IOS / AP2_ANDROID 自动禁用
+      - name: Run unit tests (CTest)
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -o pipefail
+          cd build
+          ctest --output-on-failure --build-config ${{ matrix.build_type }} -j 2 2>&1 | tee ctest-log.txt
+
+      - name: Report test errors as annotations
+        if: failure()
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [ -f build/ctest-log.txt ]; then
+            grep -E "FAILED|error:" build/ctest-log.txt | head -80 | while IFS= read -r line; do
+              echo "::error::TEST $line"
+            done
+          fi
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-log-${{ matrix.config.name }}
+          path: build/ctest-log.txt
+          if-no-files-found: ignore
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4

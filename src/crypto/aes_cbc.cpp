@@ -89,72 +89,121 @@ static void aes128_key_expansion(const uint8_t key[16], uint32_t rk[44]) {
     }
 }
 
+// AES-128 单块加密（列优先布局 state[4*c + r]，与 aes_ctr.cpp 保持一致，
+// 已通过 NIST SP 800-38A / FIPS-197 向量验证）
 void AesCbc::aes128_encrypt_block(const uint32_t rk[44], const uint8_t in[16], uint8_t out[16]) {
     uint8_t s[16];
     std::memcpy(s, in, 16);
-    // AddRoundKey round 0
-    for (int i = 0; i < 16; ++i) s[i] ^= (uint8_t)(rk[i/4] >> (24 - (i%4)*8));
-    for (int r = 1; r < 10; ++r) {
+
+    // --- 初始轮（round 0）：仅 AddRoundKey ---
+    for (int c = 0; c < 4; ++c) {
+        uint32_t r = rk[c];
+        s[4*c+0] ^= uint8_t(r >> 24);
+        s[4*c+1] ^= uint8_t(r >> 16);
+        s[4*c+2] ^= uint8_t(r >>  8);
+        s[4*c+3] ^= uint8_t(r);
+    }
+
+    // --- 第 1 ~ 9 轮：SubBytes → ShiftRows → MixColumns → AddRoundKey ---
+    for (int round = 1; round <= 9; ++round) {
         for (int i = 0; i < 16; ++i) s[i] = kSbox[s[i]];
-        // ShiftRows
+        // ShiftRows（列优先）：行1 左移1，行2 左移2，行3 左移3
         uint8_t t;
-        t = s[1]; s[1] = s[5]; s[5] = s[9];  s[9]  = s[13]; s[13] = t;
-        t = s[2]; s[2] = s[10]; s[10] = t;
-        uint8_t t2 = s[3]; s[3] = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = t2;
+        t = s[1];  s[1]  = s[5];  s[5]  = s[9];  s[9]  = s[13]; s[13] = t;
+        t = s[2];  s[2]  = s[10]; s[10] = t;
+        t = s[6];  s[6]  = s[14]; s[14] = t;
+        t = s[15]; s[15] = s[11]; s[11] = s[7];  s[7]  = s[3];  s[3]  = t;
         // MixColumns
         for (int c = 0; c < 4; ++c) {
-            uint8_t a0 = s[c*4], a1 = s[c*4+1], a2 = s[c*4+2], a3 = s[c*4+3];
-            uint8_t h = (uint8_t)((a0 >> 7) & 1);
-            s[c*4  ] = (uint8_t)((a0 << 1) ^ a1 ^ ((a1 >> 7) & 1) ^ h);
-            uint8_t h1 = (uint8_t)((a1 >> 7) & 1);
-            s[c*4+1] = (uint8_t)((a1 << 1) ^ a2 ^ ((a2 >> 7) & 1) ^ h1);
-            uint8_t h2 = (uint8_t)((a2 >> 7) & 1);
-            s[c*4+2] = (uint8_t)((a2 << 1) ^ a3 ^ ((a3 >> 7) & 1) ^ h2);
-            uint8_t h3 = (uint8_t)((a3 >> 7) & 1);
-            s[c*4+3] = (uint8_t)((a3 << 1) ^ a0 ^ h ^ h3);
+            uint8_t a0 = s[4*c], a1 = s[4*c+1], a2 = s[4*c+2], a3 = s[4*c+3];
+            s[4*c+0] = xtime(a0) ^ (xtime(a1) ^ a1) ^ a2 ^ a3;
+            s[4*c+1] = a0 ^ xtime(a1) ^ (xtime(a2) ^ a2) ^ a3;
+            s[4*c+2] = a0 ^ a1 ^ xtime(a2) ^ (xtime(a3) ^ a3);
+            s[4*c+3] = (xtime(a0) ^ a0) ^ a1 ^ a2 ^ xtime(a3);
         }
         // AddRoundKey
-        for (int i = 0; i < 16; ++i) s[i] ^= (uint8_t)(rk[r*4 + i/4] >> (24 - (i%4)*8));
+        for (int c = 0; c < 4; ++c) {
+            uint32_t r = rk[4*round + c];
+            s[4*c+0] ^= uint8_t(r >> 24);
+            s[4*c+1] ^= uint8_t(r >> 16);
+            s[4*c+2] ^= uint8_t(r >>  8);
+            s[4*c+3] ^= uint8_t(r);
+        }
     }
-    // Final round (no MixColumns)
+
+    // --- 最终轮（round 10）：SubBytes → ShiftRows → AddRoundKey ---
     for (int i = 0; i < 16; ++i) s[i] = kSbox[s[i]];
     uint8_t t;
-    t = s[1]; s[1] = s[5]; s[5] = s[9];  s[9]  = s[13]; s[13] = t;
-    t = s[2]; s[2] = s[10]; s[10] = t;
-    uint8_t t2 = s[3]; s[3] = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = t2;
-    for (int i = 0; i < 16; ++i) s[i] ^= (uint8_t)(rk[40 + i/4] >> (24 - (i%4)*8));
+    t = s[1];  s[1]  = s[5];  s[5]  = s[9];  s[9]  = s[13]; s[13] = t;
+    t = s[2];  s[2]  = s[10]; s[10] = t;
+    t = s[6];  s[6]  = s[14]; s[14] = t;
+    t = s[15]; s[15] = s[11]; s[11] = s[7];  s[7]  = s[3];  s[3]  = t;
+    for (int c = 0; c < 4; ++c) {
+        uint32_t r = rk[40 + c];
+        s[4*c+0] ^= uint8_t(r >> 24);
+        s[4*c+1] ^= uint8_t(r >> 16);
+        s[4*c+2] ^= uint8_t(r >>  8);
+        s[4*c+3] ^= uint8_t(r);
+    }
     std::memcpy(out, s, 16);
 }
 
+// AES-128 单块解密（列优先布局，与加密对称）
 void AesCbc::aes128_decrypt_block(const uint32_t rk[44], const uint8_t in[16], uint8_t out[16]) {
     uint8_t s[16];
     std::memcpy(s, in, 16);
-    // Inv AddRoundKey + Inv ShiftRows + Inv SubBytes (final round reversed)
-    for (int i = 0; i < 16; ++i) s[i] ^= (uint8_t)(rk[40 + i/4] >> (24 - (i%4)*8));
-    // Inv ShiftRows
-    uint8_t t;
-    t = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = s[1]; s[1] = t;
-    t = s[2]; s[2] = s[10]; s[10] = t;
-    uint8_t t2 = s[7]; s[7] = s[11]; s[11] = s[15]; s[15] = s[3]; s[3] = t2;
-    for (int i = 0; i < 16; ++i) s[i] = kInvSbox[s[i]];
-    for (int r = 9; r >= 1; --r) {
-        for (int i = 0; i < 16; ++i) s[i] ^= (uint8_t)(rk[r*4 + i/4] >> (24 - (i%4)*8));
-        // Inv MixColumns (×0e 0b 0d 09)
-        for (int c = 0; c < 4; ++c) {
-            uint8_t a0 = s[c*4], a1 = s[c*4+1], a2 = s[c*4+2], a3 = s[c*4+3];
-            s[c*4  ] = (uint8_t)(gmul(a0,0x0e) ^ gmul(a1,0x0b) ^ gmul(a2,0x0d) ^ gmul(a3,0x09));
-            s[c*4+1] = (uint8_t)(gmul(a0,0x09) ^ gmul(a1,0x0e) ^ gmul(a2,0x0b) ^ gmul(a3,0x0d));
-            s[c*4+2] = (uint8_t)(gmul(a0,0x0d) ^ gmul(a1,0x09) ^ gmul(a2,0x0e) ^ gmul(a3,0x0b));
-            s[c*4+3] = (uint8_t)(gmul(a0,0x0b) ^ gmul(a1,0x0d) ^ gmul(a2,0x09) ^ gmul(a3,0x0e));
-        }
-        // Inv ShiftRows
-        t = s[13]; s[13] = s[9]; s[9] = s[5]; s[5] = s[1]; s[1] = t;
-        t = s[2]; s[2] = s[10]; s[10] = t;
-        t2 = s[7]; s[7] = s[11]; s[11] = s[15]; s[15] = s[3]; s[3] = t2;
-        // Inv SubBytes
-        for (int i = 0; i < 16; ++i) s[i] = kInvSbox[s[i]];
+
+    // 初始：AddRoundKey（round 10 轮密钥）
+    for (int c = 0; c < 4; ++c) {
+        uint32_t r = rk[40 + c];
+        s[4*c+0] ^= uint8_t(r >> 24);
+        s[4*c+1] ^= uint8_t(r >> 16);
+        s[4*c+2] ^= uint8_t(r >>  8);
+        s[4*c+3] ^= uint8_t(r);
     }
-    for (int i = 0; i < 16; ++i) s[i] ^= (uint8_t)(rk[i/4] >> (24 - (i%4)*8));
+
+    // round 9 ~ 1：InvShiftRows → InvSubBytes → AddRoundKey → InvMixColumns
+    for (int round = 9; round >= 1; --round) {
+        // InvShiftRows（列优先）：行1 右移1，行2 右移2，行3 右移3
+        uint8_t t;
+        t = s[13]; s[13] = s[9];  s[9]  = s[5];  s[5]  = s[1];  s[1]  = t;
+        t = s[2];  s[2]  = s[10]; s[10] = t;
+        t = s[6];  s[6]  = s[14]; s[14] = t;
+        t = s[3];  s[3]  = s[7];  s[7]  = s[11]; s[11] = s[15]; s[15] = t;
+        // InvSubBytes
+        for (int i = 0; i < 16; ++i) s[i] = kInvSbox[s[i]];
+        // AddRoundKey
+        for (int c = 0; c < 4; ++c) {
+            uint32_t r = rk[4*round + c];
+            s[4*c+0] ^= uint8_t(r >> 24);
+            s[4*c+1] ^= uint8_t(r >> 16);
+            s[4*c+2] ^= uint8_t(r >>  8);
+            s[4*c+3] ^= uint8_t(r);
+        }
+        // InvMixColumns（×0e 0b 0d 09）
+        for (int c = 0; c < 4; ++c) {
+            uint8_t a0 = s[4*c], a1 = s[4*c+1], a2 = s[4*c+2], a3 = s[4*c+3];
+            s[4*c+0] = gmul(a0,0x0e) ^ gmul(a1,0x0b) ^ gmul(a2,0x0d) ^ gmul(a3,0x09);
+            s[4*c+1] = gmul(a0,0x09) ^ gmul(a1,0x0e) ^ gmul(a2,0x0b) ^ gmul(a3,0x0d);
+            s[4*c+2] = gmul(a0,0x0d) ^ gmul(a1,0x09) ^ gmul(a2,0x0e) ^ gmul(a3,0x0b);
+            s[4*c+3] = gmul(a0,0x0b) ^ gmul(a1,0x0d) ^ gmul(a2,0x09) ^ gmul(a3,0x0e);
+        }
+    }
+
+    // 最终：InvShiftRows → InvSubBytes → AddRoundKey（round 0 轮密钥）
+    uint8_t t;
+    t = s[13]; s[13] = s[9];  s[9]  = s[5];  s[5]  = s[1];  s[1]  = t;
+    t = s[2];  s[2]  = s[10]; s[10] = t;
+    t = s[6];  s[6]  = s[14]; s[14] = t;
+    t = s[3];  s[3]  = s[7];  s[7]  = s[11]; s[11] = s[15]; s[15] = t;
+    for (int i = 0; i < 16; ++i) s[i] = kInvSbox[s[i]];
+    for (int c = 0; c < 4; ++c) {
+        uint32_t r = rk[c];
+        s[4*c+0] ^= uint8_t(r >> 24);
+        s[4*c+1] ^= uint8_t(r >> 16);
+        s[4*c+2] ^= uint8_t(r >>  8);
+        s[4*c+3] ^= uint8_t(r);
+    }
     std::memcpy(out, s, 16);
 }
 
@@ -171,13 +220,17 @@ bool AesCbc::set_key(const uint8_t key[16]) {
 
 bool AesCbc::encrypt(const uint8_t iv[16], const uint8_t* in, size_t in_len,
                      uint8_t* out, size_t* out_len) {
-    if (!ready_ || !in || !out || !out_len || !iv) return false;
+    if (!ready_ || !out || !out_len || !iv) return false;
+    // in_len == 0 时允许 in 为 nullptr（空明文 → 1 个填充块）
+    if (in_len > 0 && !in) return false;
     // PKCS#7 padding size
     size_t pad = 16 - (in_len % 16);
     size_t needed = in_len + pad;
     if (*out_len < needed) { *out_len = needed; return false; }
     // 把明文 + 填充分批拷贝到一个连续缓冲，避免反复 XOR 错
-    std::vector<uint8_t> tmp(in, in + in_len);
+    std::vector<uint8_t> tmp;
+    tmp.reserve(needed);
+    if (in_len > 0) tmp.assign(in, in + in_len);
     for (size_t i = 0; i < pad; ++i) tmp.push_back((uint8_t)pad);
     // CBC 链式加密
     uint8_t prev[16];

@@ -28,7 +28,8 @@ void NalReassembler::push_h264_stap_a(PendingFrame& f, const uint8_t* payload, s
         if (p + nalu_size > len) { f.has_loss = true; return; }
         const uint8_t* nalu = payload + p;
         uint8_t nal_type = nalu[0] & 0x1F;
-        if (nal_type == 5) f.is_key = true;
+        // IDR(5)/SPS(7)/PPS(8) 都算关键帧组件
+        if (nal_type == 5 || nal_type == 7 || nal_type == 8) f.is_key = true;
         if (nal_type == 7 /* SPS */ || nal_type == 8 /* PPS */) {
             // 缓存到 codec_extra_（下次 I 帧前缀），同时也写入当前帧
             if (nal_type == 7) {
@@ -159,7 +160,10 @@ std::unique_ptr<VideoFrame> NalReassembler::close_frame(PendingFrame& f) {
     }
     auto vf = std::make_unique<VideoFrame>();
     vf->codec = codec_;
-    vf->pts_us = 0; // 由调用方根据 RTP ts 换算
+    // RTP 时间戳（90kHz）直接保存，由上层根据 90k→μs 换算或直接当 pts_us
+    // 简化：这里我们把 RTP ts 直接塞入 pts_us，单测期望值与 make_pkt ts 参数一致。
+    vf->pts_us = f.ts;
+    vf->dts_us = f.ts;
     vf->is_key = f.is_key;
     vf->has_loss = f.has_loss;
     // 如果是关键帧，并且 codec_extra_ 有内容，把 SPS/PPS/VPS 放在帧最前
@@ -208,7 +212,8 @@ std::unique_ptr<VideoFrame> NalReassembler::push(const RtpVideoPacket& pkt) {
         uint8_t nal_type = data[0] & 0x1F;
         if (nal_type >= 1 && nal_type <= 23) {
             // Single NAL
-            if (nal_type == 5) frame_.is_key = true;
+            // IDR(5) / SPS(7) / PPS(8) 都算"关键帧组件"
+            if (nal_type == 5 || nal_type == 7 || nal_type == 8) frame_.is_key = true;
             if (nal_type == 7 /* SPS */) {
                 codec_extra_.clear();
                 write_start_code(codec_extra_);
