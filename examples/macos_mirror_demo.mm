@@ -43,7 +43,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -372,7 +371,10 @@ private:
     AudioStreamBasicDescription asbd_{};
     AudioConfig cfg_;
     std::mutex mu_;
-    std::deque<uint8_t> pending_;
+    // 注意：必须用连续存储（vector 而非 deque）——FillBuffer 会对
+    // &pending_[0] 直接 memcpy n 字节；deque 的块存储不连续，跨块读取
+    // 会越界（ASan: heap-buffer-overflow）
+    std::vector<uint8_t> pending_;
     bool configured_ = false;
     bool playing_ = false;
     float volume_ = 1.0f;
@@ -386,7 +388,7 @@ private:
         size_t cap = buf->mAudioDataBytesCapacity;
         size_t n = std::min(cap, pending_.size());
         if (n > 0) {
-            memcpy(buf->mAudioData, &pending_[0], n);
+            memcpy(buf->mAudioData, pending_.data(), n);
             pending_.erase(pending_.begin(), pending_.begin() + n);
         } else {
             memset(buf->mAudioData, 0, cap);
@@ -517,6 +519,13 @@ static std::atomic<bool> g_running{true};
 
 - (void)applicationWillTerminate:(NSNotification*)note {
     g_running.store(false);
+}
+
+// 禁用系统窗口状态恢复（NSPersistentUI）：投屏接收器不需要恢复窗口，
+// 且 macOS 12 在状态目录异常时可能直接 abort 崩溃
+- (BOOL)applicationSupportsSecureRestorableState:(NSApplication*)app {
+    (void)app;
+    return NO;
 }
 
 - (void)volumeChanged:(id)sender {

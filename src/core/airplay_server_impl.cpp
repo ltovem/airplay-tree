@@ -180,7 +180,28 @@ bool ServerImpl::on_setup(uint64_t conn_id, int remote[3], int allocated_ports[3
     auto* sess = get_impl(conn_id);
     if (!sess) sess = ensure_session(conn_id, "");
     if (!sess) return false;
-    // 先分配音频 3 端口（data/rtcp/timing）
+    // 客户端先 SETUP 音频（返回音频 3 端口），再 SETUP 视频（返回视频 data 端口）。
+    // 之前两次都返回音频端口，导致视频 RTP 发到音频端口上收不到。
+    if (sess->setup_count() >= 1 && sess->has_video()) {
+        sess->note_setup();
+        uint16_t vp = sess->video_data_port();
+        if (vp == 0) {
+            int video_remote = (remote && remote[0]) ? remote[0] + 2 : 0;
+            vp = sess->allocate_video_port(cfg_.rtp_port_min, cfg_.rtp_port_max, video_remote);
+        }
+        if (vp != 0) {
+            // 视频 data 端口；ctrl/timing 当前复用音频那对，规范上按 vp+1/vp+2 告知
+            allocated_ports[0] = vp;
+            allocated_ports[1] = (uint16_t)(vp + 1);
+            allocated_ports[2] = (uint16_t)(vp + 2);
+            AP2_LOGI("server: session %lu video SETUP -> server_port=%u",
+                     (unsigned long)conn_id, (unsigned)vp);
+            return true;
+        }
+        return false;
+    }
+    // 音频 SETUP（第一次）
+    sess->note_setup();
     bool ok = sess->allocate_ports(remote, cfg_.rtp_port_min, cfg_.rtp_port_max, allocated_ports);
     if (ok && sess->has_video()) {
         // 另外在池中再找一个视频 data 端口

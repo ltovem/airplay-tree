@@ -51,6 +51,11 @@ public:
     /// Allocate a video data port; returns 0 on fail
     uint16_t allocate_video_port(uint16_t port_min, uint16_t port_max,
                                   int remote_data_port = 0);
+    /// 已分配的本地视频 data 端口（0 表示未分配）
+    uint16_t video_data_port() const { return video_local_port_; }
+    /// RTSP SETUP 计数：第 1 次 = 音频，之后 = 视频（客户端先 SETUP 音频再 SETUP 视频）
+    int setup_count() const { return setup_count_; }
+    void note_setup() { setup_count_++; }
 
     /// Configure audio / video codec (after ANNOUNCE SDP parsing)
     void configure_audio(const net::SdpInfo& sdp);
@@ -111,6 +116,7 @@ private:
     int rtp_local_ports_[3] = {0,0,0};
     net::VideoRtpReceiver video_rtp_;
     uint16_t video_local_port_ = 0;
+    int setup_count_ = 0; // RTSP SETUP 次数（0=未 SETUP，1=音频，2+=视频）
 
     // Audio pipeline
     codec::AlacDecoder alac_;

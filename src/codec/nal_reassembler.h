@@ -62,13 +62,22 @@ public:
     NalReassembler() = default;
     ~NalReassembler() = default;
 
-    void set_codec(VideoCodec c) { codec_ = c; }
-    VideoCodec codec() const { return codec_; }
+    void set_codec(VideoCodec c) { std::lock_guard<std::mutex> lk(mu_); codec_ = c; }
+    VideoCodec codec() const { std::lock_guard<std::mutex> lk(mu_); return codec_; }
 
     /// 设置 SPS/PPS（H.264）或 VPS/SPS/PPS（H.265）。
     /// 这些参数会在每次 IDR 帧前自动 prepend 到 Annex-B 输出。
-    void set_codec_data(const std::vector<uint8_t>& extra) { codec_extra_ = extra; }
-    const std::vector<uint8_t>& codec_data() const { return codec_extra_; }
+    /// 注意：RTP worker 线程会在 push() 里同时写 codec_extra_（缓存 SPS/PPS），
+    /// 所以这里必须加锁，否则与 worker 线程数据竞争会损坏 vector 内部状态
+    /// （ASan: container-overflow），导致进程崩溃。
+    void set_codec_data(const std::vector<uint8_t>& extra) {
+        std::lock_guard<std::mutex> lk(mu_);
+        codec_extra_ = extra;
+    }
+    std::vector<uint8_t> codec_data() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return codec_extra_; // 返回拷贝：避免调用方持引用访问已释放的锁
+    }
 
     /// 喂入一个 RTP 视频包；返回"完整帧"若该包让某帧闭合。
     /// has_loss 在这一帧非空时意味着：要么该帧本身有碎片丢了，要么前面
@@ -78,9 +87,15 @@ public:
     /// 强制 flush 未完成的帧（用于流切换 / TEARDOWN / SET_PARAMETER）。
     std::unique_ptr<VideoFrame> flush();
 
-    /// 丢包计数（仅供 stats）
-    uint64_t packets_fragmented() const { return frag_ctr_; }
-    uint64_t frames_lost() const { return frame_loss_ctr_; }
+    /// 丢包计数（仅供 stats；跨线程读取需加锁）
+    uint64_t packets_fragmented() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return frag_ctr_;
+    }
+    uint64_t frames_lost() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return frame_loss_ctr_;
+    }
 
 private:
     /* ---- H.264 NAL header helpers ---- */
@@ -118,7 +133,8 @@ private:
     bool         have_first_seq_ = false;
     uint64_t     frag_ctr_ = 0;
     uint64_t     frame_loss_ctr_ = 0;
-    std::mutex   mu_;
+    // mutable：const getter（codec()/codec_data()/计数）也需要加锁
+    mutable std::mutex mu_;
 
     /// 处理 H.264 STAP-A (24)：多 NAL 聚合包
     void push_h264_stap_a(PendingFrame& f, const uint8_t* payload, size_t len);

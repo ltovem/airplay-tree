@@ -39,12 +39,6 @@ public:
     /// Join the thread (blocks until exit)
     void join();
 
-    /// 与底层 std::thread 解绑：线程继续运行但不再可 join。
-    /// 用于"线程自己管理自己生命周期"的场景（如每连接一线程），
-    /// 必须先 detach() 再析构，否则析构里的 join() 会对自身线程
-    /// join（self-join）→ std::system_error → 未捕获 → 进程崩溃。
-    void detach();
-
     /// Combined stop + join
     void stop_and_join() { request_stop(); join(); }
 

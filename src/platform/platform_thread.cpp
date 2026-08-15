@@ -65,11 +65,5 @@ void Thread::join() {
     }
 }
 
-void Thread::detach() {
-    if (impl_ && impl_->t.joinable()) {
-        impl_->t.detach();
-    }
-}
-
 } // namespace platform
 } // namespace airplay2

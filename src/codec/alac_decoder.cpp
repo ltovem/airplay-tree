@@ -245,6 +245,9 @@ int64_t AlacDecoder::decode_frame(const uint8_t* data, size_t len,
     int channels   = (int)br.read(4);
     (void)br.read(8); // unused
     if (channels == 0) channels = cookie_.num_channels;
+    // 解码器只支持 1/2 声道（decoded[2]、predictor_num[2]、coefs[2][32] 均为 2 路）；
+    // 畸形/恶意数据可能给出超大 channels，必须夹到 [1,2]，否则数组越界
+    if (channels < 1 || channels > 2) channels = 2;
     if (samples_per_chan <= 0) { samples_per_chan = cookie_.frame_length; }
     if (samples_per_chan > 65536) samples_per_chan = 4096;
 
