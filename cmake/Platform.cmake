@@ -36,8 +36,19 @@ message(STATUS "  Linux:   ${AP2_LINUX}")
 message(STATUS "  POSIX:   ${AP2_POSIX}")
 
 # 字节序检测
+# 交叉编译时 test_big_endian 会 try_run（编译+执行），target 二进制无法在 host 运行。
+# 此时改用架构推断：aarch64 / arm64 / ppc64 等默认大端之外都是小端。
 include(TestBigEndian)
-test_big_endian(AP2_BIG_ENDIAN)
+if(CMAKE_CROSSCOMPILING)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64|s390x")
+        set(AP2_BIG_ENDIAN TRUE)
+    else()
+        set(AP2_BIG_ENDIAN FALSE)
+    endif()
+    message(STATUS "[airplay2] Cross-compiling: assuming big-endian=${AP2_BIG_ENDIAN} for ${CMAKE_SYSTEM_PROCESSOR}")
+else()
+    test_big_endian(AP2_BIG_ENDIAN)
+endif()
 if(AP2_BIG_ENDIAN)
     add_compile_definitions(AP2_BYTE_ORDER_BIG_ENDIAN=1)
 else()

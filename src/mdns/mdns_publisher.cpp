@@ -10,6 +10,8 @@
 #include "platform/platform_log.h"
 #include "platform/platform_time.h"
 #include <cstring>
+#include <cstdio>   // std::snprintf
+#include <cctype>   // std::isalnum, std::tolower
 #include <random>
 
 #if AP2_PLATFORM_WINDOWS

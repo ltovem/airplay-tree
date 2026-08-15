@@ -10,6 +10,11 @@
 #include <functional>
 #include <string>
 
+// Android NDK 需要 <android/log.h> 才能使用 __android_log_print / ANDROID_LOG_*
+#if AP2_PLATFORM_ANDROID
+    #include <android/log.h>
+#endif
+
 namespace airplay2 {
 namespace platform {
 

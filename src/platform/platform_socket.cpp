@@ -35,7 +35,9 @@
         #include <linux/netlink.h>
         #include <linux/rtnetlink.h>
         #include <ifaddrs.h>
-    #elif AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS
+        #include <net/if.h>
+    #elif AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS || AP2_PLATFORM_ANDROID
+        // Android API 24+ 才有 getifaddrs；低版本走 fallback 分支
         #include <ifaddrs.h>
         #include <net/if.h>
     #endif

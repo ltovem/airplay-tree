@@ -16,5 +16,9 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 
+# 交叉编译时 try_run 无法在 host 执行 target 二进制，
+# 改用 STATIC_LIBRARY 避免链接阶段失败（CMake 3.6+）
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+
 # 只在交叉编译阶段告诉代码不要跑示例（示例需要本机执行）
 set(AIRPLAY2_BUILD_EXAMPLES OFF CACHE BOOL "Build examples for arm64 cross")
