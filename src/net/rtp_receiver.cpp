@@ -129,28 +129,45 @@ static inline uint16_t seq_diff(uint16_t a, uint16_t b) {
 }
 
 void RtpReceiver::emit_ready() {
+    // 缺失包等待超时（微秒）。100ms ≈ 12 个包；等太久会让后续包把
+    // 抖动缓冲占满，最终整批丢弃（~1 秒音频），远不如早跳损失 ~24ms。
+    static constexpr uint64_t kGapTimeoutUs = 100000ULL;
     std::vector<RtpAudioPacket> to_emit;
     {
         std::lock_guard<std::mutex> lk(jbuf_mu_);
-        if (jbuffer_.empty()) return;
+        if (jbuffer_.empty()) {
+            gap_wait_start_us_ = 0;
+            return;
+        }
         if (!has_started_) {
             next_expected_seq_ = jbuffer_.begin()->first;
             has_started_ = true;
         }
+        uint64_t now_us = platform::time_now_us();
         while (!jbuffer_.empty()) {
             auto it = jbuffer_.find(next_expected_seq_);
             if (it == jbuffer_.end()) {
                 auto lowest = jbuffer_.begin();
                 uint16_t diff = seq_diff(lowest->first, next_expected_seq_);
-                if (diff > jbuf_max_ / 2) {
-                    AP2_LOGW("rtp: jump seq %u -> %u (gap=%u)",
-                             next_expected_seq_, lowest->first, diff);
-                    stats_.lost += diff;
+                // 缺口太大（> 半缓冲）或等待超时 → 按丢失跳过缺失段
+                if (diff > jbuf_max_ / 2 || (gap_wait_start_us_ != 0 &&
+                                             now_us - gap_wait_start_us_ >= kGapTimeoutUs)) {
+                    if (diff > 0) {
+                        AP2_LOGW("rtp: jump seq %u -> %u (gap=%u%s)",
+                                 next_expected_seq_, lowest->first, diff,
+                                 (diff > jbuf_max_ / 2) ? "" : ", timeout");
+                        stats_.lost += diff;
+                    }
                     next_expected_seq_ = lowest->first;
+                    gap_wait_start_us_ = 0;
                     continue;
                 }
+                // 首次发现缺口：记录等待起点
+                if (gap_wait_start_us_ == 0) gap_wait_start_us_ = now_us;
                 break;
             }
+            // 连续包来了，缺口已消除
+            gap_wait_start_us_ = 0;
             to_emit.push_back(std::move(it->second));
             jbuffer_.erase(it);
             next_expected_seq_++;
@@ -207,6 +224,9 @@ void RtpReceiver::receiver_worker() {
         if (!platform::select_read(socks, ready, 100)) {
             platform::sleep_ms(20);
             maybe_send_rr();
+            // 即使没有新包到达，也要定期检查"缺失包等待超时"，
+            // 否则卡住的缺口要等下一个包到来才会触发跳包。
+            emit_ready();
             continue;
         }
         for (size_t idx : ready) {

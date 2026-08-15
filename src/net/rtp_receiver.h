@@ -236,6 +236,10 @@ private:
     std::map<uint16_t, RtpAudioPacket>     jbuffer_;
     uint16_t next_expected_seq_ = 0;   ///< 下一个期望 seq；初始值来自首个到达包
     bool     has_started_       = false;///< 是否见过首个包（首次包用于初始化 next_expected_seq_）
+    // 期望包缺失的起始时刻（单调钟，微秒）。若缺失包在 kGapTimeoutUs 内
+    // 不到，就按"已丢失"跳过，避免死等导致抖动缓冲被 128 个后续包占满后
+    // 整批丢弃（曾导致每次卡顿损失 ~1 秒音频，实测 3 次）。
+    uint64_t gap_wait_start_us_ = 0;
     Stats    stats_;                   ///< 统计（只在 worker 写，读不加锁，快照近似）
     // 128 包 ≈ 44100Hz / 4096 samples ≈ 11 FPS → 约 11 秒最大缓存，足以
     // 覆盖 WiFi 常见 burst 延迟；太小会频发丢包误判；太大带来播放延迟。

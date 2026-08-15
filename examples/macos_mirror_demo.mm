@@ -780,6 +780,9 @@ private:
      */
     void DrainLocked() {
         if (!configured_ || !player_ || !fmt_) return;
+        // 欠载自恢复：AVAudioPlayerNode 在调度队列耗尽时会停，需要重新 play()
+        // 才会继续播放后续调度的缓冲。若应播放却没在播，补一次 play。
+        if (playing_ && ![player_ isPlaying]) [player_ play];
         size_t bpf = BytesPerFrameLocked();
         if (bpf == 0) return;
         const size_t kChunkFrames = (size_t)(cfg_.sample_rate * 40 / 1000);  // 40ms
