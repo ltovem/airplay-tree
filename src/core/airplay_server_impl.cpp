@@ -223,8 +223,10 @@ net::Ap2SetupResponse ServerImpl::on_setup_ap2(uint64_t conn_id,
         if (s.type == 110 || s.type == 98)
             sess->set_stream_connection_id(s.stream_connection_id);
     }
-
-    // 分配音频 3 端口（data/ctrl/timing）——AP2 音频流 type=96 必须给
+    // 分配（或复用已分配的）音频 3 端口 data/ctrl/timing。
+    // 关键：iOS 镜像流程在 SETUP(110) 后校验 timingPort，必须给真实端口，
+    // 0 会直接 TEARDOWN（音频流程碰巧在 SETUP 96 补上真实端口所以能过）。
+    // 端口在首次 SETUP（空流+ekey，或首个带流 SETUP）分配，后续复用。
     int remote[3] = {0, 0, 0};
     int local[3] = {0, 0, 0};
     bool have_audio = false;
@@ -238,24 +240,32 @@ net::Ap2SetupResponse ServerImpl::on_setup_ap2(uint64_t conn_id,
             break;
         }
     }
-    if (have_audio) {
+    if (have_audio || !req.ekey.empty() || !req.streams.empty()) {
         if (!sess->allocate_ports(remote, cfg_.rtp_port_min, cfg_.rtp_port_max, local)) {
-            AP2_LOGW("server: AP2 SETUP audio port allocation failed");
+            AP2_LOGW("server: AP2 SETUP port allocation failed");
             return out; // ok=false
         }
-        net::Ap2StreamResp sr;
-        sr.type = 96;
-        sr.data_port = local[0];
-        sr.control_port = local[1];
-        out.streams.push_back(sr);
-        out.timing_port = local[2];
+        out.timing_port = local[2];   // 真实 timing 端口（NTP）
+        if (have_audio) {
+            net::Ap2StreamResp sr;
+            sr.type = 96;
+            sr.data_port = local[0];
+            sr.control_port = local[1];
+            out.streams.push_back(sr);
+        }
     }
 
-    // 视频/mirroring 流：单 data 端口
+    // 视频/mirroring 流：单 data 端口。
+    // AirPlay 2 镜像视频走 TCP Data Push：iOS 会主动 connect 到该端口推流，
+    // 所以必须绑 TCP listener（UDP 端口 iOS 连不上会立即 TEARDOWN）。
     for (const auto& s : req.streams) {
         if (s.type == 110 || s.type == 98) {
+            // streamConnectionID 只在 SETUP(110) 里携带，而 RECORD 可能已过：
+            // 拿到真 ID 后重新派生视频解密密钥（RECORD 时派生的是 ID=0 的错 key）。
+            sess->set_stream_connection_id(s.stream_connection_id);
+            sess->update_video_media_key();
             uint16_t vp = sess->allocate_video_port(cfg_.rtp_port_min, cfg_.rtp_port_max,
-                                                    (int)s.control_port);
+                                                    (int)s.control_port, /*use_tcp=*/true);
             if (vp == 0) {
                 AP2_LOGW("server: AP2 SETUP video port allocation failed");
                 continue;
@@ -264,9 +274,12 @@ net::Ap2SetupResponse ServerImpl::on_setup_ap2(uint64_t conn_id,
             sr.type = s.type;
             sr.data_port = vp;
             out.streams.push_back(sr);
-            AP2_LOGI("server: AP2 SETUP video type=%llu dataPort=%u streamConnectionID=%llu",
+            AP2_LOGI("server: AP2 SETUP video type=%llu dataPort=%u (TCP push) streamConnectionID=%llu",
                      (unsigned long long)s.type, (unsigned)vp,
                      (unsigned long long)s.stream_connection_id);
+            // RECORD 早于 SETUP(110) 时视频接收线程还没启动，这里补上
+            if (sess->state() == AirPlaySession::State::PLAYING)
+                sess->start_video_streaming();
         }
     }
 

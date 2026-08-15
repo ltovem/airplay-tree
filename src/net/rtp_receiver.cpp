@@ -128,6 +128,13 @@ static inline uint16_t seq_diff(uint16_t a, uint16_t b) {
     return (uint16_t)(int16_t)(a - b);
 }
 
+// 有符号 16 位距离：正确处理 RTP 序列号 16 位回绕。
+// AAC-ELD 每个包重复发 3 次（乱序：0 0 1 0 1 2 1 2 3...），
+// 若按无符号 diff 计算，旧包会被误判成 65535 的巨大 gap。
+static inline int16_t seq_dist(uint16_t a, uint16_t b) {
+    return (int16_t)(a - b);
+}
+
 void RtpReceiver::emit_ready() {
     // 缺失包等待超时（微秒）。100ms ≈ 12 个包；等太久会让后续包把
     // 抖动缓冲占满，最终整批丢弃（~1 秒音频），远不如早跳损失 ~24ms。
@@ -148,7 +155,15 @@ void RtpReceiver::emit_ready() {
             auto it = jbuffer_.find(next_expected_seq_);
             if (it == jbuffer_.end()) {
                 auto lowest = jbuffer_.begin();
-                uint16_t diff = seq_diff(lowest->first, next_expected_seq_);
+                // 用有符号距离判断：若 jbuffer 里最低 seq 比期望旧（负距离），
+                // 说明是重复/乱序旧包（AAC-ELD 每包发 3 次），直接丢弃，
+                // 绝不当作 gap 跳转——否则旧包永远清不掉，陷入 jump 循环。
+                int16_t sdist = seq_dist(lowest->first, next_expected_seq_);
+                if (sdist < 0) {
+                    jbuffer_.erase(lowest);
+                    continue;
+                }
+                uint16_t diff = (uint16_t)sdist;
                 // 缺口太大（> 半缓冲）或等待超时 → 按丢失跳过缺失段
                 if (diff > jbuf_max_ / 2 || (gap_wait_start_us_ != 0 &&
                                              now_us - gap_wait_start_us_ >= kGapTimeoutUs)) {

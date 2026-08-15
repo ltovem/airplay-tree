@@ -285,6 +285,51 @@ std::string RtspServer::build_info_plist(const DeviceInfo& dev) {
         kvi("pk", 0);
     }
     kvi("acl", 0);
+
+    // ---- 镜像关键字段：声明"本机有显示器"（对齐 UxPlay raop_handler_info）----
+    // 缺少 displays 数组时，iOS 认为设备没有视频输出能力：
+    // 屏幕镜像列表不显示本设备 / 点了也连不上（日志里从无 type=110 SETUP）。
+    oss << "<key>displays</key><array><dict>\n";
+    oss << "<key>uuid</key><string>e0ff8a27-6738-3d56-8a16-cc53aacee925</string>\n";
+    kvi("widthPhysical", 0);
+    kvi("heightPhysical", 0);
+    kvi("width", 1920);
+    kvi("height", 1080);
+    kvi("widthPixels", 1920);
+    kvi("heightPixels", 1080);
+    oss << "<key>rotation</key><false/>\n";      // bit8(ScreenRotate) 关闭时用 false（AppleTV gen3 为 true）
+    oss << "<key>refreshRate</key><real>0.016667</real>\n";  // 1/60s
+    kvi("maxFPS", 60);
+    oss << "<key>overscanned</key><false/>\n";
+    kvi("features", 14);                         // 对齐 UxPlay displays features
+    oss << "</dict></array>\n";
+
+    // 保活与版本（iOS 用这些判断设备类型/能力）
+    kvi("keepAliveLowPower", 1);
+    oss << "<key>keepAliveSendStatsAsBody</key><true/>\n";
+    kv("sourceVersion", "220.68");
+    oss << "<key>initialVolume</key><real>1.0</real>\n";
+
+    // audioLatencies / audioFormats（AirPlay 2 设备能力声明，UxPlay 同款）
+    oss << "<key>audioLatencies</key><array>";
+    oss << "<dict><key>type</key><integer>100</integer>"
+        << "<key>inputLatencyMicros</key><integer>0</integer>"
+        << "<key>audioType</key><string>default</string>"
+        << "<key>outputLatencyMicros</key><integer>0</integer></dict>";
+    oss << "<dict><key>type</key><integer>101</integer>"
+        << "<key>inputLatencyMicros</key><integer>0</integer>"
+        << "<key>audioType</key><string>default</string>"
+        << "<key>outputLatencyMicros</key><integer>0</integer></dict>";
+    oss << "</array>\n";
+    oss << "<key>audioFormats</key><array>";
+    oss << "<dict><key>audioOutputFormats</key><integer>67108860</integer>"   // 0x3FFFFFC
+        << "<key>type</key><integer>100</integer>"
+        << "<key>audioInputFormats</key><integer>67108860</integer></dict>";
+    oss << "<dict><key>audioOutputFormats</key><integer>67108860</integer>"
+        << "<key>type</key><integer>101</integer>"
+        << "<key>audioInputFormats</key><integer>67108860</integer></dict>";
+    oss << "</array>\n";
+
     oss << "</dict></plist>\n";
     return oss.str();
 }

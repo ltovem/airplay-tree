@@ -277,7 +277,19 @@ void EnqueueSample(AVSampleBufferDisplayLayer* layer, CMFormatDescriptionRef des
     if (CMSampleBufferCreateReady(kCFAllocatorDefault, block, desc, 1, 1,
                                   &timing, 1, &sample_size, &sb) == noErr) {
         [layer enqueueSampleBuffer:sb];
+        // 诊断：检查显示层是否报错（P 帧解码失败会报 -12909 kCMSampleBufferError 之类）
+        if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+            NSError* err = layer.error;
+            static int printed = 0;
+            if (printed++ < 5)
+                fprintf(stderr, "[Video] layer FAILED: %s\n",
+                        err ? err.localizedDescription.UTF8String : "unknown");
+        }
         CFRelease(sb);
+    } else {
+        static int printed = 0;
+        if (printed++ < 5)
+            fprintf(stderr, "[Video] CMSampleBufferCreateReady failed\n");
     }
     CFRelease(block);
 }
@@ -410,6 +422,25 @@ private:
     void handle_frame(const VideoFrame& frame) {
         if (!layer_ || frame.annex_b.empty()) return;
         frames_total_++; // UI 统计：计数到达的完整帧
+        // 诊断：dump 前 600 帧到文件，用 ffprobe 验证数据能否解码
+        static FILE* dump_f = nullptr;
+        if (frames_total_ <= 600) {
+            if (!dump_f) dump_f = fopen("/tmp/mirror_video.h264", "wb");
+            if (dump_f) fwrite(frame.annex_b.data(), 1, frame.annex_b.size(), dump_f);
+            if (frames_total_ == 600 && dump_f) { fclose(dump_f); dump_f = nullptr; }
+        }
+        // 诊断：打印前几帧的 codec/NAL 类型/是否关键帧，确认解码路径
+        if (frames_total_ <= 5) {
+            auto nals = ExtractNals(frame.annex_b.data(), frame.annex_b.size());
+            fprintf(stderr, "[Video] frame#%llu codec=%d key=%d nals=%zu sizes=%zu B: ",
+                    (unsigned long long)frames_total_, (int)frame.codec,
+                    (int)frame.is_key, nals.size(), frame.annex_b.size());
+            for (size_t i = 0; i < nals.size() && i < 4; ++i) {
+                uint8_t nt = nals[i].empty() ? 0 : nals[i][0];
+                fprintf(stderr, "0x%02X ", nt);
+            }
+            fprintf(stderr, "\n");
+        }
         // 先把带内参数集缓存下来（无论是否已有 fmt_desc_，参数集更新后需重建）
         CacheParamSets(frame);
         // 丢包：AVSampleBufferDisplayLayer 不会自动跳过坏帧，需要 flush，
@@ -423,6 +454,10 @@ private:
             // 1) 优先用 SDP sprop-parameter-sets 构造的描述符（handle_config 已建）
             // 2) 否则用带内缓存的 SPS/PPS（可能比关键帧自身携带的更完整）
             fmt_desc_ = BuildFromCache();
+            if (frames_total_ <= 10)
+                fprintf(stderr, "[Video] fmt_desc_ build: %s (sps=%zu pps=%zu vps=%zu)\n",
+                        fmt_desc_ ? "OK" : "FAIL",
+                        sps_.size(), pps_.size(), vps_.size());
             if (!fmt_desc_) return;
         }
         // 提交 slice 数据（参数集由 fmt_desc_ 携带，避免重复解码参数集）
@@ -431,7 +466,15 @@ private:
         if (slices.empty()) return;
         auto avcc = AnnexBToAvcc(slices.data(), slices.size());
         if (avcc.empty()) return;
-        EnqueueSample(layer_, fmt_desc_, avcc.data(), avcc.size(), frame.pts_us);
+        // PTS 必须基于宿主时钟（CACurrentMediaTime）——AVSampleBufferDisplayLayer
+        // 用它与当前时间比较决定何时显示。库传来的 pts_us 是单调时钟微秒，
+        // 量级与 CACurrentMediaTime 不同，会导致 layer 只显示第一帧。
+        uint64_t pts_us = (uint64_t)(CACurrentMediaTime() * 1000000.0);
+        if (frames_total_ <= 5 || (frames_total_ % 300) == 0)
+            fprintf(stderr, "[Video] frame#%llu key=%d enqueue %zu B (slices=%zu) pts=%llu\n",
+                    (unsigned long long)frames_total_, (int)frame.is_key,
+                    avcc.size(), slices.size(), (unsigned long long)pts_us);
+        EnqueueSample(layer_, fmt_desc_, avcc.data(), avcc.size(), pts_us);
         if (pending_flush_ && frame.is_key) pending_flush_ = false;
     }
 };
@@ -521,11 +564,18 @@ public:
         }
         // AudioToolbox 需要 MPEG-4 描述符包装的 cookie（不是裸 ASC）
         auto cookie = BuildAacMagicCookie(asc);
-        // 输入 = AAC（对象类型由 magic cookie 决定：ELD / LC），输出 = PCM16
+        // 输入 = AAC（对象类型由 magic cookie 决定：ELD / LC），输出 = PCM16。
+        // 注意：ELD 必须用 kAudioFormatMPEG4AAC_ELD（'aace'）而不是通用的
+        // kAudioFormatMPEG4AAC（'aac '），否则 AudioConverterSetProperty 的
+        // magic cookie 会被拒（实测返回 !dat）。
+        // 判断依据用 cfg.format（session 已置为 AAC_ELD），不要用 codec 字符串——
+        // codec_mode_ 是 "mpeg4-generic" 不含 "eld"。
         AudioStreamBasicDescription in{};
         in.mSampleRate = cfg.sample_rate ? cfg.sample_rate : 44100;
         in.mChannelsPerFrame = cfg.channels ? cfg.channels : 2;
-        in.mFormatID = kAudioFormatMPEG4AAC;
+        in.mFormatID = (cfg.format == AudioFormat::AAC_ELD)
+                           ? kAudioFormatMPEG4AAC_ELD
+                           : kAudioFormatMPEG4AAC;
         memset(&aac_out_asbd_, 0, sizeof(aac_out_asbd_));
         aac_out_asbd_.mSampleRate = in.mSampleRate;
         aac_out_asbd_.mChannelsPerFrame = in.mChannelsPerFrame;
@@ -556,6 +606,11 @@ public:
         if (!data || len == 0) return Status::OK;
         std::lock_guard<std::mutex> lk(mu_);
         if (!aac_ready_ || !aac_conv_) return Status::OK;
+        // 诊断：前几个 AAC 包打印大小，确认数据真的到达解码器
+        if (aac_packets_.load() < 3)
+            fprintf(stderr, "[AAC] compressed pkt len=%zu first=0x%02X 0x%02X 0x%02X 0x%02X\n",
+                    len, data[0], len > 1 ? data[1] : 0,
+                    len > 2 ? data[2] : 0, len > 3 ? data[3] : 0);
         aac_bytes_total_ += len;
         aac_packets_++;
         // 攒够一批再解码：AudioConverter 的 AAC 解码器有 1 帧 lookahead，

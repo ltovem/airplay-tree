@@ -48,9 +48,11 @@ public:
     /// Allocate audio RTP ports (data/ctrl/timing); fills ports[3]
     bool allocate_ports(int remote_ports[3], uint16_t port_min, uint16_t port_max,
                         int local_ports[3]);
-    /// Allocate a video data port; returns 0 on fail
+    /// Allocate a video data port; returns 0 on fail.
+    /// @param use_tcp true = AirPlay 2 镜像走 TCP Data Push（iOS connect 推流），
+    ///                false = AirPlay 1 视频走 UDP RTP
     uint16_t allocate_video_port(uint16_t port_min, uint16_t port_max,
-                                  int remote_data_port = 0);
+                                  int remote_data_port = 0, bool use_tcp = false);
 
     /// Configure audio / video codec (after ANNOUNCE SDP parsing)
     void configure_audio(const net::SdpInfo& sdp);
@@ -117,6 +119,12 @@ public:
     /// RECORD（start_streaming）前调用；成功后可配置 RTP 解密。
     void derive_media_keys();
 
+    /// 用当前 stream_connection_id_ + audio_key_ 重新派生视频密钥并配置
+    /// video_rtp_ 解密。镜像时 SETUP(110) 常晚于 RECORD 到达，而
+    /// streamConnectionID 只在 SETUP(110) 里携带——RECORD 时 ID 还是 0，
+    /// 视频密钥是错的；拿到真 ID 后必须重新派生一次。
+    void update_video_media_key();
+
 private:
     void on_rtp_packet(const net::RtpAudioPacket& pkt);
     void on_video_frame(const VideoFrame& f);
@@ -178,6 +186,8 @@ private:
     SessionStats stats_;
     uint64_t session_start_us_ = 0;
     uint32_t first_sample_rate_ = 0;
+    // 诊断：RTP 包序号（on_rtp_packet 前几包打印 codec_mode_）
+    uint64_t pkt_count_ = 0;
 };
 
 } // namespace airplay2

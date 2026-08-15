@@ -1,15 +1,20 @@
 /*!
  * @file video_rtp.h
- * @brief AirPlay 视频 RTP 接收器（与音频独立，3 端口 UDP）
+ * @brief AirPlay 视频 RTP 接收器（UDP RTP 或 TCP Data Push 两种模式）
  *
- * AirPlay 视频 / 屏幕镜像使用与音频相同的 3-UDP-port 结构，但：
- *   - 视频 RTP 时钟频率 = 90000 Hz（不是音频 44100/48000）
- *   - Payload type 默认 96（H.264）或 97（H.265），具体在 SDP 里协商
- *   - 没有 ALAC/AAC，而是 RTP packetization (RFC 6184/7798)
- *   - 控制面仍用 RTCP SR/RR + Timing Protocol（和音频走同一套）
+ * AirPlay 屏幕镜像（Screen Mirroring / Data Push）有两种传输：
+ *   - **TCP Data Push**（AirPlay 2 镜像默认，iOS 走这条）：
+ *     在 SETUP(110) 响应返回的 dataPort 上建立 TCP listener，iOS 主动
+ *     connect 后按 "128 字节头 + payload" 帧格式推流。头里前 4 字节是
+ *     payload 长度（大端），packet[4] 标识类型（0x00=加密VCL、
+ *     0x01=未加密 SPS/PPS、0x02=旧协议空包、0x05=streaming report），
+ *     packet[8:16] 是 NTP 时间戳（自开机纳秒，无 1900 偏移）。
+ *     负载是 [4B NAL 长度][NAL] 序列，AES-CTR 加密。
+ *   - **UDP RTP**（AirPlay 1 视频 / HLS 前的旧路径）：3 端口结构，
+ *     RTP packetization (RFC 6184/7798)，与音频共享 ctrl/timing。
  *
- * 因此我们复用 rtp_receiver 里的 UDP 端口分配 / RR / Timing 逻辑，
- * 只替换 RTP data 的处理为 NAL 重组。
+ * 本类两种模式都支持：open() 绑 UDP，open_tcp() 绑 TCP listener；
+ * 输出统一为 Annex-B 的 VideoFrame 回调（IVideoRenderer）。
  */
 #ifndef AIRPLAY2_VIDEO_RTP_H
 #define AIRPLAY2_VIDEO_RTP_H
@@ -54,6 +59,13 @@ public:
     /// 可传 -1 表示不绑定，由外部管理）。返回 true 成功
     bool open(uint16_t data_port_min, uint16_t data_port_max, uint16_t& out_data_port);
 
+    /// 绑定 TCP Data Push 监听端口（AirPlay 2 镜像默认传输）。
+    /// iOS 会主动 connect 到 out_data_port 并按 128B 头 + payload 帧格式推流。
+    bool open_tcp(uint16_t port_min, uint16_t port_max, uint16_t& out_data_port);
+
+    /// 是否 TCP Data Push 模式（决定 receiver_worker 的帧解析路径）
+    bool is_tcp() const { return tcp_mode_; }
+
     /// 启动后台收包线程。若端口尚未绑定（AP2 中 RECORD 可能早于镜像 SETUP），
     /// 会延迟到 open() 成功后自动启动。
     void start();
@@ -81,12 +93,16 @@ public:
 
 private:
     void receiver_worker();
+    void tcp_push_worker();
 
     VideoCodec codec_ = VideoCodec::H264_AVC;
     codec::NalReassembler reassembler_;
     VideoFrameCb cb_;
 
     platform::Socket data_sock_;
+    // TCP Data Push 模式下 accept 到的数据连接（iOS 主动连入）
+    platform::Socket push_conn_;
+    bool tcp_mode_ = false;
     std::string sender_ip_;
     int sender_port_ = 0;
 

@@ -14,6 +14,37 @@
 
 namespace airplay2 {
 
+// ISO 14496-3 AudioSpecificConfig（AAC-ELD, audioObjectType=39）构造。
+// AP2 镜像音频（ct=8）的 SETUP 不带 RFC 3640 fmtp，渲染器必须靠 config=
+// 创建解码器；按规范把 ELD 的 ASC 拼成 3 字节十六进制字符串。
+//   bit layout: 11111(escape) 000111(39-32=7) SFI(4) CC(4) frmLenFlag(1) depCore(1) extFlag(1)
+//   SFI 表: 96000=0 88200=1 64000=2 48000=3 44100=4 32000=5 24000=6 22050=7 16000=8 12000=9 11025=10 8000=11 7350=12
+static std::string build_eld_asc(uint32_t sample_rate, uint32_t channels) {
+    static const uint32_t kSfiTable[] = {96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350};
+    uint32_t sfi = 4; // 默认 44100
+    for (size_t i = 0; i < sizeof(kSfiTable)/sizeof(kSfiTable[0]); ++i) {
+        if (sample_rate == kSfiTable[i]) { sfi = (uint32_t)i; break; }
+    }
+    if (channels == 0) channels = 2;
+    uint32_t cc = (channels > 7) ? 2 : channels; // channelConfiguration 最多 4bit（7 声道规范内）
+    // 逐位拼（27 位，含 escape 的 11 位 + SFI + CC + 3 个 flag）
+    uint64_t bits = 0; int n = 0;
+    auto put = [&](uint64_t v, int w) { bits = (bits << w) | (v & ((1ULL<<w)-1)); n += w; };
+    put(31, 5);              // audioObjectType escape → 31
+    put(39 - 32, 6);         // AOT 39 (ELD)
+    put(sfi, 4);
+    put(cc, 4);
+    put(0, 1);               // frameLengthFlag = 0（480 samples/frame）
+    put(0, 1);               // dependsOnCoreCoder
+    put(0, 1);               // extensionFlag
+    while (n % 8) { bits <<= 1; ++n; } // 补零到字节对齐
+    char hex[16];
+    std::snprintf(hex, sizeof(hex), "%02X%02X%02X",
+                  (unsigned)((bits >> 16) & 0xFF), (unsigned)((bits >> 8) & 0xFF),
+                  (unsigned)(bits & 0xFF));
+    return std::string(hex);
+}
+
 void SessionImpl::derive_media_keys() {
     if (!server_) return;
     media_keys_ready_ = false;
@@ -37,12 +68,26 @@ void SessionImpl::derive_media_keys() {
     h.final(digest);
     std::memcpy(audio_key_, digest, 16);
 
+    media_keys_ready_ = true;
+    AP2_LOGI("session %lu: media keys derived (audio CBC + video CTR, connID=%llu)",
+             (unsigned long)id_, (unsigned long long)stream_connection_id_);
+    // 音频密钥已就绪，视频密钥依赖 streamConnectionID（SETUP(110) 提供）；
+    // 若 ID 已拿到就一并派生，否则等 update_video_media_key() 补。
+    if (stream_connection_id_ != 0) update_video_media_key();
+}
+
+void SessionImpl::update_video_media_key() {
     // 视频 key/iv = SHA512("AirPlayStreamKey/IV{id}" || audio_key) 前 16B
+    // （UxPlay mirror_buffer_init_aes 同款）。镜像流程里 SETUP(110) 常晚于
+    // RECORD 到达，streamConnectionID 只有在 SETUP(110) 才有——所以 RECORD
+    // 时派生的是错 key（ID=0），拿到真 ID 后必须在这里重算并重配解密。
+    if (!media_keys_ready_ || stream_connection_id_ == 0) return;
     char kb[64], ib[64];
     std::snprintf(kb, sizeof(kb), "AirPlayStreamKey%llu",
                   (unsigned long long)stream_connection_id_);
     std::snprintf(ib, sizeof(ib), "AirPlayStreamIV%llu",
                   (unsigned long long)stream_connection_id_);
+    uint8_t digest[64];
     crypto::Sha512 k, v;
     k.update((const uint8_t*)kb, std::strlen(kb));
     k.update(audio_key_, 16);
@@ -52,9 +97,9 @@ void SessionImpl::derive_media_keys() {
     v.update(audio_key_, 16);
     v.final(digest);
     std::memcpy(video_iv_, digest, 16);
-
-    media_keys_ready_ = true;
-    AP2_LOGI("session %lu: media keys derived (audio CBC + video CTR, connID=%llu)",
+    if (video_local_port_ != 0)
+        video_rtp_.set_decryption_key(video_key_, video_iv_);
+    AP2_LOGI("session %lu: video media key updated (connID=%llu)",
              (unsigned long)id_, (unsigned long long)stream_connection_id_);
 }
 
@@ -86,6 +131,12 @@ SessionStats SessionImpl::stats() const {
 
 bool SessionImpl::allocate_ports(int remote_ports[3], uint16_t port_min, uint16_t port_max,
                                   int local_ports[3]) {
+    // 幂等：端口已分配（SETUP 1 预分配）时直接复用，避免 AP2 多次 SETUP
+    // （空流 SETUP / 音频 96 / 镜像 110）每次返回不同端口导致 iOS 混乱。
+    if (rtp_local_ports_[0] != 0) {
+        for (int i = 0; i < 3; ++i) local_ports[i] = rtp_local_ports_[i];
+        return true;
+    }
     if (!rtp_.open(port_min, port_max, rtp_local_ports_)) {
         AP2_LOGE("session: could not allocate RTP ports in %u-%u", port_min, port_max);
         return false;
@@ -166,11 +217,18 @@ void SessionImpl::configure_ap2_audio(uint64_t ct, uint64_t spf, uint64_t sr) {
         alac_.configure(cookie);
         audio_cfg_ = alac_.output_config();
     } else {
-        // AAC-ELD / 其他：压缩帧透传给渲染器（demo 的 AudioConverter 解码）
+        // AAC-ELD / 其他：压缩帧透传给渲染器（demo 的 AudioConverter 解码）。
+        // AP2 镜像音频（ct=8 AAC-ELD）没有 ANNOUNCE/fmtp，渲染器拿不到
+        // RFC 3640 的 config=，导致解码器无法创建（日志 "no config in fmtp"）。
+        // 这里按 ISO 14496-3 手工构造 ELD AudioSpecificConfig 补上：
+        //   bits: 11111(escape) 000111(AOT=39 ELD) SFI(4) CC(4)
+        //         frameLengthFlag(1) dependsOnCoreCoder(1) extensionFlag(1)
         codec_mode_ = "mpeg4-generic";
         audio_cfg_.format = AudioFormat::AAC_ELD;
+        std::string config_hex = build_eld_asc(audio_cfg_.sample_rate, audio_cfg_.channels);
+        std::string fmtp = "config=" + config_hex;
         if (audio_renderer_) {
-            audio_renderer_->on_compressed_config(codec_mode_, "", audio_cfg_);
+            audio_renderer_->on_compressed_config(codec_mode_, fmtp, audio_cfg_);
         }
     }
     pcm_buffer_.set_config(audio_cfg_);
@@ -257,6 +315,12 @@ void SessionImpl::on_rtp_packet(const net::RtpAudioPacket& pkt) {
     size_t samples = 0;
     std::string lower_mode = codec_mode_;
     for (char& c : lower_mode) c = (char)std::tolower((unsigned char)c);
+    // 诊断：打印前几个包走哪个分支，确认 codec_mode_ 时序是否正确
+    if (pkt_count_ < 3) {
+        AP2_LOGI("session %lu: rtp pkt#%llu mode='%s' len=%zu", (unsigned long)id_,
+                 (unsigned long long)pkt_count_, codec_mode_.c_str(), pkt.payload.size());
+    }
+    ++pkt_count_;
 
     if (alac_.is_configured() &&
         (lower_mode.find("applelossless") != std::string::npos || lower_mode == "alac")) {
@@ -274,6 +338,13 @@ void SessionImpl::on_rtp_packet(const net::RtpAudioPacket& pkt) {
                lower_mode.find("aac") != std::string::npos) {
         // AAC-ELD / AAC：压缩帧原样透传给渲染器（demo 用 AudioConverter 解码），
         // 不走 PCM 缓冲。未配置解码器时渲染器内部会丢弃。
+        // UxPlay：AAC-ELD 流开头的 4 字节 "no_data_marker"(0x00 0x68 0x34 0x00)
+        // 替换了 payload 的包不是音频，必须跳过，否则解码器吃垃圾。
+        if (pkt.payload.size() == 4 &&
+            pkt.payload[0] == 0x00 && pkt.payload[1] == 0x68 &&
+            pkt.payload[2] == 0x34 && pkt.payload[3] == 0x00) {
+            return;
+        }
         if (audio_renderer_) {
             audio_renderer_->on_compressed_audio(pkt.payload.data(), pkt.payload.size(),
                                                  pkt.recv_us);
@@ -341,13 +412,17 @@ void SessionImpl::playback_worker() {
  *                    Video port allocation / configure
  * ================================================================ */
 uint16_t SessionImpl::allocate_video_port(uint16_t port_min, uint16_t port_max,
-                                           int remote_data_port) {
+                                           int remote_data_port, bool use_tcp) {
     uint16_t p = 0;
-    if (!video_rtp_.open(port_min, port_max, p)) return 0;
+    bool ok = use_tcp ? video_rtp_.open_tcp(port_min, port_max, p)
+                      : video_rtp_.open(port_min, port_max, p);
+    if (!ok) return 0;
     video_local_port_ = p;
     if (!client_addr_.empty() && remote_data_port > 0) {
         video_rtp_.set_remote_address(client_addr_, remote_data_port);
     }
+    // 若密钥已派生（RECORD 已过），把正确的视频解密密钥配给接收器
+    if (media_keys_ready_) video_rtp_.set_decryption_key(video_key_, video_iv_);
     return p;
 }
 
