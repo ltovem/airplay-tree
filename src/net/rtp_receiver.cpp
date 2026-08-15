@@ -226,6 +226,10 @@ void RtpReceiver::maybe_send_rr() {
     } else {
         return; // 没可用地址就不发（避免 sendto 抛错）
     }
+    // 诊断（临时）：确认我们确实在回 RR（iOS 缺失 RR 约 30s 会踢掉会话）
+    static uint64_t dbg_rr = 0;
+    if (dbg_rr++ < 5)
+        AP2_LOGI("rtcp: RR sent (sender_ssrc=%u highest_seq=%u)", (unsigned)sr.ssrc, highest_seq);
     last_rr_send_us_ = now_us;
 }
 
@@ -347,7 +351,17 @@ void RtpReceiver::receiver_worker() {
             else if (idx == 1) {
                 // 记录来自谁（RR 回给同一个 peer，能穿过 NAT）
                 ctrl_peer_ = from;
-                rtcp_.handle_packet(buf, (size_t)r.bytes);
+                // 诊断（临时）：确认 iOS 是否真的发 SR（决定我们是否回 RR）
+                static uint64_t dbg_rtcp = 0;
+                if (dbg_rtcp++ < 5) {
+                    bool had = rtcp_.has_sr();
+                    rtcp_.handle_packet(buf, (size_t)r.bytes);
+                    AP2_LOGI("rtcp: recv %uB first=0x%02X pt=0x%02X has_sr_now=%d (was=%d)",
+                             (unsigned)r.bytes, buf[0], buf[1],
+                             rtcp_.has_sr() ? 1 : 0, had ? 1 : 0);
+                } else {
+                    rtcp_.handle_packet(buf, (size_t)r.bytes);
+                }
             }
             // ======== timing socket (AirPlay timing) ==========================
             else if (idx == 2) {

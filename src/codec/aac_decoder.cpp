@@ -249,8 +249,20 @@ int64_t AacDecoder::decode_frame(const uint8_t* data, size_t len,
     UInt32 npk = impl_->is_eld ? 480 : 1024;
     OSStatus st = AudioConverterFillComplexBuffer(impl_->conv, AacInputProc,
                                                   impl_, &npk, &abl, nullptr);
+    // 诊断（临时）：解码出错或"零输出"只打印前几次——定位"解到一半停掉"的真相
+    static uint64_t dbg_err = 0;
+    if (st != noErr && dbg_err++ < 5) {
+        fprintf(stderr, "[AAC] FillComplexBuffer err=%d(%c%c%c%c) npk=%u len=%zu\n",
+                (int)st, (char)((st >> 24) & 0xFF), (char)((st >> 16) & 0xFF),
+                (char)((st >> 8) & 0xFF), (char)(st & 0xFF), (unsigned)npk, len);
+    }
     if (st != noErr) return -1;
     size_t produced = abl.mBuffers[0].mDataByteSize;
+    static uint64_t dbg_zero = 0;
+    if (produced == 0 && dbg_zero++ < 5) {
+        fprintf(stderr, "[AAC] zero output len=%zu npk=%u (lookahead hold?)\n",
+                len, (unsigned)npk);
+    }
     if (produced > 0) out_pcm.assign(outbuf, outbuf + produced);
     return (int64_t)len;  // 单帧输入视为全部消耗
 }

@@ -114,6 +114,12 @@ public:
     void set_stream_connection_id(uint64_t id) { stream_connection_id_ = id; }
     uint64_t stream_connection_id() const { return stream_connection_id_; }
 
+    /// 保存客户端（iPhone）的 timing 端口（SETUP 请求里 timingPort 字段）。
+    /// AirPlay 镜像要求接收端**主动**向该端口发 NTP 请求做时钟同步
+    /// （RPiPlay/KqSMea8 raop_rtp_mirror_thread_time 同款）；缺失时
+    /// iOS 等不到同步会 ~30 秒后自行 TEARDOWN。
+    void set_client_timing_port(uint16_t p) { client_timing_port_ = p; }
+
     /// 派生媒体密钥（AP2）：fairplay_sap_decrypt(keymsg, ekey) → raw，
     /// 音频密钥 = SHA512(raw||ecdh_secret)[0:16]；
     /// 视频 key/iv = SHA512("AirPlayStreamKey/IV{id}"||audio_key)[0:16]。
@@ -130,6 +136,8 @@ private:
     void on_rtp_packet(const net::RtpAudioPacket& pkt);
     void on_video_frame(const VideoFrame& f);
     void playback_worker();
+    /// AirPlay 镜像时钟同步：周期向客户端 timing 端口发 NTP 请求（RPiPlay 同款）
+    void timing_worker();
     void transition(AirPlaySession::State s) { state_.store(s); }
 
     uint64_t const id_;
@@ -165,6 +173,12 @@ private:
     // Playback thread (audio)
     platform::Thread playback_thread_;
     std::atomic<bool> playback_stop_{false};
+
+    // AirPlay 镜像时钟同步（timing 客户端）
+    platform::Thread timing_thread_;
+    std::atomic<bool> timing_stop_{false};
+    uint16_t client_timing_port_ = 0;       ///< iPhone 的 timing 端口（SETUP timingPort）
+    std::atomic<uint64_t> sync_clock_us_{0}; ///< 最近一次 NTP 响应 T2（µs，1900 epoch）
 
     // Volume
     std::atomic<float> volume_{1.0f};

@@ -5,6 +5,7 @@
 #include "airplay_server_impl.h"
 #include "../platform/platform_log.h"
 #include "../platform/platform_time.h"
+#include "../platform/platform_socket.h"
 #include "../crypto/fairplay_sap.h"
 #include "../crypto/sha512.h"
 #include <cstring>
@@ -13,6 +14,35 @@
 #include <utility>     // std::swap（声道交错转换）
 
 namespace airplay2 {
+
+// ===== AirPlay 镜像时钟同步（NTP 客户端，RPiPlay raop_rtp_mirror 同款）=====
+// 接收端每 ~3 秒向 iPhone 的 timing 端口发一个 48 字节标准 NTP 客户端请求
+// （VN=4, Mode=3, transmit timestamp 在 offset 40），iPhone 回一个 NTP
+// 服务器响应；T2（Receive Timestamp, offset 32）即"iPhone 收到我们请求的
+// 时刻"，用它把视频帧 NTP 时间戳换算成我们的时钟（A/V 同步）。
+// 不做这个同步，iOS 等不到时钟校准会 ~30 秒后自行 TEARDOWN 会话。
+namespace {
+
+// NTP epoch（1900-01-01）与 Unix epoch（1970-01-01）秒差
+constexpr uint64_t kNtpUnixOffsetSec = 2208988800ULL;
+
+// 把"自 1900 epoch 的微秒数"写成 64 位 NTP 时间戳（秒<<32|分数，大端）
+void put_ntp_ts(uint8_t* p, uint64_t us_since_1900) {
+    uint64_t secs = us_since_1900 / 1000000ULL;
+    uint64_t frac = ((us_since_1900 % 1000000ULL) << 32) / 1000000ULL;
+    for (int i = 3; i >= 0; --i) p[i] = (uint8_t)((secs >> (8 * i)) & 0xFF);
+    for (int i = 3; i >= 0; --i) p[4 + i] = (uint8_t)((frac >> (8 * i)) & 0xFF);
+}
+
+// 读 64 位 NTP 时间戳 → "自 1900 epoch 的微秒数"
+uint64_t read_ntp_ts(const uint8_t* p) {
+    uint64_t secs = 0, frac = 0;
+    for (int i = 0; i < 4; ++i) secs = (secs << 8) | p[i];
+    for (int i = 0; i < 4; ++i) frac = (frac << 8) | p[4 + i];
+    return secs * 1000000ULL + (frac * 1000000ULL) / 0x100000000ULL;
+}
+
+} // namespace
 
 // ISO 14496-3 AudioSpecificConfig（AAC-ELD, audioObjectType=39）构造。
 // AP2 镜像音频（ct=8）的 SETUP 不带 RFC 3640 fmtp，渲染器必须靠 config=
@@ -249,6 +279,10 @@ void SessionImpl::start_streaming() {
     }
     rtp_.start();
     playback_thread_.start([this] { playback_worker(); }, "ap2-playback");
+    // 镜像时钟同步：拿到客户端 timing 端口后周期发 NTP 请求（防止 iOS 自断）
+    if (client_timing_port_ != 0 && !timing_stop_.load()) {
+        timing_thread_.start([this] { timing_worker(); }, "ap2-timing");
+    }
     playing_.store(true);
     // 若会话已配置视频，也启动视频 RTP
     if (video_local_port_ != 0) start_video_streaming();
@@ -285,6 +319,10 @@ void SessionImpl::stop_streaming() {
     playback_stop_.store(true);
     playing_.store(false);
     video_playing_.store(false);
+    // 停掉镜像时钟同步线程
+    if (timing_stop_.exchange(true) == false) {
+        timing_thread_.stop_and_join();
+    }
     rtp_.stop();
     video_rtp_.stop();
     playback_thread_.stop_and_join();
@@ -342,6 +380,12 @@ void SessionImpl::on_rtp_packet(const net::RtpAudioPacket& pkt) {
         int64_t used = aac_.decode_frame(pkt.payload.data(), pkt.payload.size(), pcm);
         if (used < 0) return;
         (void)used;
+        // 诊断（临时）：每 300 个 AAC 包打印一次，确认解码调用是否持续
+        static uint64_t dbg_aac_call = 0;
+        if ((dbg_aac_call++ % 300) == 0)
+            AP2_LOGI("session %lu: aac decode call#%llu len=%zu out_pcm=%zu",
+                     (unsigned long)id_, (unsigned long long)dbg_aac_call,
+                     pkt.payload.size(), pcm.size());
         samples = pcm_buffer_.write_bytes(pcm.data(), pcm.size());
     } else if (lower_mode.find("l16") != std::string::npos || lower_mode == "pcm") {
         // Raw PCM 16-bit big-endian? AirPlay L16 is usually BE.
@@ -399,6 +443,39 @@ void SessionImpl::playback_worker() {
         size_t got = pcm_buffer_.read_frames(tmp.data(), remaining);
         if (got > 0) audio_renderer_->on_pcm(tmp.data(), got * bpf, platform::time_now_us());
     }
+}
+
+void SessionImpl::timing_worker() {
+    // 镜像时钟同步：周期向 iPhone 的 timing 端口发 48B NTP 客户端请求
+    //（RPiPlay raop_rtp_mirror_thread_time 同款）。失败不影响主流程，
+    // 但要保持请求节奏——iOS 等不到同步会 ~30s 后自断。
+    platform::Socket sock;
+    if (!sock.create(platform::SocketProtocol::UDP, false)) return;
+    if (client_addr_.empty() || client_timing_port_ == 0) {
+        sock.close();
+        return;
+    }
+    uint8_t req[48] = {0};
+    req[0] = 0x23;  // NTP: LI=0, VN=4, Mode=3(client)
+    uint8_t buf[48];
+    while (!timing_stop_.load()) {
+        // transmit timestamp（offset 40）= 我们当前时钟（自 1900 的 µs）
+        put_ntp_ts(req + 40, platform::wallclock_us() + kNtpUnixOffsetSec * 1000000ULL);
+        sock.sendto(req, sizeof(req), client_addr_, client_timing_port_);
+        // 等响应（最长 1s）：解析 T2（Receive Timestamp, offset 32）
+        int rev = 0;
+        if (sock.poll(1 /*POLLIN*/, 1000, rev) && (rev & 1)) {
+            platform::SocketAddr from;
+            auto r = sock.recvfrom(buf, sizeof(buf), &from);
+            if (r.ok && r.bytes >= 48) {
+                sync_clock_us_.store(read_ntp_ts(buf + 32));
+            }
+        }
+        // 每 3 秒一轮
+        for (int i = 0; i < 30 && !timing_stop_.load(); ++i)
+            platform::sleep_ms(100);
+    }
+    sock.close();
 }
 
 /* ================================================================

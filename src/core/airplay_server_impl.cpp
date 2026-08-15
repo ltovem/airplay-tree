@@ -219,6 +219,9 @@ net::Ap2SetupResponse ServerImpl::on_setup_ap2(uint64_t conn_id,
 
     // 保存 FairPlay 密钥材料与流信息，供 RECORD 后解密 RTP 用
     sess->set_ap2_keys(req.ekey, req.eiv);
+    // 保存客户端 timing 端口：镜像时钟同步（NTP 请求）要发给它，
+    // 否则 iOS 等不到时钟校准会 ~30 秒后自行 TEARDOWN（RPiPlay 同款行为）。
+    if (req.timing_port != 0) sess->set_client_timing_port((uint16_t)req.timing_port);
     for (const auto& s : req.streams) {
         if (s.type == 110 || s.type == 98)
             sess->set_stream_connection_id(s.stream_connection_id);
