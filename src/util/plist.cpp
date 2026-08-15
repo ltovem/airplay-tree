@@ -494,25 +494,13 @@ static bool bplist_parse_object(const uint8_t* data, size_t len, uint64_t offset
             else table[ref_id] = PlistValue(); // NONE
             return true;
         }
-        case 0x01: { // signed int
+        case 0x01: { // int（Apple CFBinaryPlist：1/2/4 字节 = 无符号，8 字节 = 有符号）
             int bytes = 1 << (int)low; // low: 0=1B 1=2B 2=4B 3=8B
             if (p + bytes > len) return false;
-            int64_t signed_val;
-            if (bytes == 1) signed_val = (int8_t)data[p];
-            else if (bytes == 2) {
-                int16_t sv = (int16_t)(be_read_varint(data + p, 2));
-                signed_val = sv;
-            } else if (bytes == 4) {
-                int32_t sv = (int32_t)(be_read_varint(data + p, 4));
-                signed_val = sv;
-            } else if (bytes == 8) {
-                uint64_t u = be_read_varint(data + p, 8);
-                signed_val = (int64_t)u;
-            } else {
-                // 更宽的不支持（rare）
-                signed_val = (int64_t)be_read_varint(data + p, std::min(bytes, 8));
-            }
-            table[ref_id] = PlistValue::make_int(signed_val);
+            uint64_t u = be_read_varint(data + p, bytes);
+            // 1/2/4 字节按无符号读（plistlib '>H'/'>I' 同款）：0xAC44=44100 必须为正数，
+            // 若按有符号扩展会得 -21436，采样率等字段变天文数字 → 播放永不启动。
+            table[ref_id] = PlistValue::make_int((int64_t)u);
             return true;
         }
         case 0x02: { // real
@@ -837,10 +825,12 @@ uint64_t bplist_encode(const PlistValue& v, std::vector<uint8_t>& body,
         }
         case PlistType::INT: {
             int64_t val = v.as_int();
-            int bytes = 1;
-            if (val < INT8_MIN || val > INT8_MAX) bytes = 2;
-            if (val < INT16_MIN || val > INT16_MAX) bytes = 4;
-            if (val < INT32_MIN || val > INT32_MAX) bytes = 8;
+            // 与 plistlib 一致：负数一律用 8 字节有符号（1/2/4 字节按无符号读），
+            // 否则 -2000 写成 2 字节 0xF830，对端按无符号读回 63536。
+            int bytes = (val < 0) ? 8 : 1;
+            if (val > INT8_MAX) bytes = 2;
+            if (val > INT16_MAX) bytes = 4;
+            if (val > INT32_MAX) bytes = 8;
             int power = 0;
             while ((1 << power) < bytes) ++power;
             body.push_back(0x10 | (uint8_t)power);

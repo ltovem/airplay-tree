@@ -448,6 +448,25 @@ TEST(BinaryPlist, SerializeRoundtrip_SetupResponse) {
     EXPECT_EQ(bs.array()[1].get_int("type"), int64_t(110));
 }
 
+TEST(BinaryPlist, ParseUnsignedInt_HighBitSet_SampleRate) {
+    // 回归：iOS AP2 SETUP 的 sr=44100 以 2 字节 bplist int 编码（0xAC44，
+    // 最高位为 1）。此前解析器按有符号扩展成 -21436，导致采样率变成
+    // 42.9 亿、播放线程永不输出 PCM。bplist 1/2/4 字节 int 必须按无符号读。
+    auto d = PlistValue::make_dict();
+    d.dict()["sr"]  = PlistValue::make_int(44100);   // 0xAC44
+    d.dict()["spf"] = PlistValue::make_int(352);
+    d.dict()["ct"]  = PlistValue::make_int(2);
+
+    std::vector<uint8_t> bytes;
+    EXPECT_TRUE(serialize_binary_plist(d, bytes));
+
+    PlistValue back;
+    EXPECT_TRUE(parse_binary_plist(bytes.data(), bytes.size(), back));
+    EXPECT_EQ(back.get_int("sr"),  int64_t(44100));
+    EXPECT_EQ(back.get_int("spf"), int64_t(352));
+    EXPECT_EQ(back.get_int("ct"),  int64_t(2));
+}
+
 TEST(BinaryPlist, SerializeRoundtrip_DataAndLongString) {
     // 覆盖 data 类型和 >=15 字节长字符串（扩展长度编码路径）
     auto d = PlistValue::make_dict();

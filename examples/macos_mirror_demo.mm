@@ -1039,10 +1039,11 @@ static std::atomic<bool> g_running{true};
     cfg.device.supports_audio = true;
     cfg.device.supports_video = true;
     cfg.device.supports_photo = true;
-    // 对齐 UxPlay FEATURES_1=0x5A7FFEE6（实测 iOS 可投屏）。
+    // 0x5A7FFFF7 = 真实 Apple TV 3 抓包值（含 bit0=Video/bit7=Screen/bit8=ScreenRotate），
+    // iOS 判定"可镜像"需要 Video 位：只给 bit7 会被归为纯音频 → 镜像栏显示音响。
     // 注意 bit26(HasUnifiedAdvertiserInfo) 必须为 0：置 1 会让 iOS 强制走
     // /auth-setup MFi 握手，没有 MFi 证书时 iOS 直接断开（曾导致"投不上"）。
-    cfg.device.features = 0x5A7FFEE6;
+    cfg.device.features = 0x5A7FFFF7;
     {
         std::hash<std::string> h;
         size_t hv = h(device_name_);

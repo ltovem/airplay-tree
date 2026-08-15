@@ -63,10 +63,10 @@ struct AudioConfig {
  *   bit14=Authentication4 bit19/20=AudioFormat2/3（AirPlay2 必需）
  *   bit23=Authentication1(RSA legacy) bit26=HasUnifiedAdvertiserInfo
  *   bit27=SupportsLegacyPairing bit30=RAOP
- * 默认 features 对齐 UxPlay 的 FEATURES_1=0x5A7FFEE6（实测 iOS 可投屏），
- * 关键点：bit26 必须为 0 —— 置 1 会宣告"MFi 统一广告信息"，
- * iOS 会强制走 /auth-setup（MFi 握手），需要真实 MFi 证书 + RSA-1024 签名，
- * 开源接收器没有该证书，iOS 校验失败直接断开。
+ * 默认 features = 0x5A7FFFF7（与真实 Apple TV 3 抓包一致，含 bit0=Video、
+ * bit7=Screen、bit8=ScreenRotate）。关键点：bit26 必须为 0 —— 置 1 会宣告
+ * "MFi 统一广告信息"，iOS 会强制走 /auth-setup（MFi 握手），需要真实 MFi
+ * 证书 + RSA-1024 签名，开源接收器没有该证书，iOS 校验失败直接断开。
  */
 struct DeviceInfo {
     std::string name;        ///< 显示名（UI 上看到的音箱名）
@@ -77,9 +77,13 @@ struct DeviceInfo {
     uint16_t    port     = 7000;            ///< AirPlay RTSP 控制端口（默认 7000；改了要同时改 ServerConfig）
     // 为什么是 32 位？：按 AirPlay 协议 feature 位已经超过 uint16
     // （bit0=video、bit7=screen、bit26=MFi 广告等），必须用 uint32。
-    // 0x5A7FFEE6 = UxPlay 实测可用的值：视频/屏幕镜像/音频/FPSAP/legacy配对/RAOP 全开，
-    // 且 bit26(HasUnifiedAdvertiserInfo)=0 避免 iOS 触发 MFi /auth-setup。
-    uint32_t    features = 0x5A7FFEE6;      ///< Feature flags 位图
+    // 0x5A7FFFF7 = 真实 Apple TV 3 抓包值（elcuervo/airplay issue #63）：
+    //   bit0(Video)+bit7(Screen)+bit8(ScreenRotate)+bit9(Audio)+bit14(Auth4)
+    //   +bit19/20(AudioFormat2/3)+bit27(LegacyPairing)+bit30(RAOP)，
+    //   且 bit26(HasUnifiedAdvertiserInfo)=0 避免 iOS 触发 MFi /auth-setup。
+    // 相比 UxPlay 的 0x5A7FFEE6，多了 bit0/bit4/bit8——iOS 判定"可镜像"
+    // 需要 Video 位（部分版本仅看 bit7 会把它归为纯音频 → 镜像栏显示音响）。
+    uint32_t    features = 0x5A7FFFF7;      ///< Feature flags 位图
     uint8_t     protocol_version = 1;       ///< AirPlay 协议版本：1 = AP1/AP2 兼容
     bool        supports_audio = true;      ///< 宣告支持音频（关闭后仅能做屏幕镜像接收器）
     bool        supports_video = true;      ///< 宣告支持视频（镜像 / HLS 拉流）
