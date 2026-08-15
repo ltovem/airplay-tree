@@ -4,6 +4,7 @@
 #include "platform_thread.h"
 #include <thread>
 #include <vector>
+#include <cstring>   // std::memcpy（Linux/Android 设置线程名时使用）
 
 #if AP2_PLATFORM_MACOS || AP2_PLATFORM_IOS
     #include <pthread.h>
@@ -35,7 +36,7 @@ static void set_current_thread_name(const std::string& name) {
 #elif AP2_PLATFORM_WINDOWS
     // SetThreadDescription requires Win10+; use the older SetThreadName via exception trick
     // We skip this to avoid exception complexity; names are for debugging only anyway.
-    (void)buf;
+    (void)name;
 #endif
 }
 

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <string>     // std::stoi / std::stoll（Content-Length 等头解析）
 
 namespace airplay2 {
 namespace net {

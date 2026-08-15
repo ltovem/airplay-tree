@@ -41,7 +41,10 @@ jobs:
             cc: ''
             cxx: ''
             examples: ON
-            cmake_extra: '-G "Visual Studio 17 2022" -A x64'
+            # 不硬编码 -G "Visual Studio 17 2022"：windows-latest 镜像可能升级到 VS 2025，
+            # 硬编码会导致 "could not find any instance of Visual Studio"。
+            # 只指定 -A x64，CMake 会自动选择 runner 上已安装的最新 VS 生成器。
+            cmake_extra: '-A x64'
 
     steps:
       - name: Checkout

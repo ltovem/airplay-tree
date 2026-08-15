@@ -8,6 +8,7 @@
 #include <sstream>
 #include <cmath>
 #include <functional>
+#include <cctype>     // std::tolower（设备名 / 参数名归一化）
 
 namespace airplay2 {
 

@@ -5,6 +5,7 @@
 #include "../platform/platform_log.h"
 #include <sstream>
 #include <cstring>
+#include <cstdio>     // std::snprintf（构建 RTSP/SDP 响应行）
 #include <cstdlib>
 #include <algorithm>
 

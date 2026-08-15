@@ -5,9 +5,12 @@
 #include "platform/platform_log.h"
 #include "platform/platform_time.h"
 #include <cstring>
+#include <cstdio>     // std::snprintf
 #include <cinttypes>
-#include <arpa/inet.h>
+#include <string>     // std::stoi / std::to_string
 
+// inet_pton / inet_addr 在 Windows 上由 <ws2tcpip.h> / <winsock2.h> 提供，
+// 而在 *nix 上由 <arpa/inet.h> 提供；必须放进平台分支里，否则 MSVC 编译报错。
 #if AP2_PLATFORM_WINDOWS
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
@@ -18,6 +21,7 @@
     #include <sys/types.h>
     #include <sys/socket.h>
     #include <netinet/in.h>
+    #include <arpa/inet.h>
 #endif
 
 namespace airplay2 {

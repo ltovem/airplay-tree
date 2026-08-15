@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <algorithm>   // std::min / std::max（LPC 重建时裁剪样本范围）
 #include <sstream>
 
 namespace airplay2 {

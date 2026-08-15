@@ -4,6 +4,7 @@
 #include "airplay_pairing.h"
 #include "../platform/platform_log.h"
 #include <cstring>
+#include <string>     // std::stoi（PIN 码数值解析）
 
 namespace airplay2 {
 

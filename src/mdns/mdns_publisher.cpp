@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cstdio>   // std::snprintf
 #include <cctype>   // std::isalnum, std::tolower
+#include <string>   // std::stoi（TXT 记录数值字段解析）
 #include <random>
 
 #if AP2_PLATFORM_WINDOWS

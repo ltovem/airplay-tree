@@ -6,6 +6,7 @@
 #include "../platform/platform_time.h"
 #include <algorithm>
 #include <cstring>
+#include <cctype>     // std::tolower（HTTP header 名大小写不敏感比较）
 
 namespace airplay2 {
 namespace net {
