@@ -41,6 +41,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -436,7 +437,11 @@ private:
 };
 
 // ============================================================================
-// MacAudioRenderer —— 用 AudioQueue 播放 PCM
+// MacAudioRenderer —— 用 AVAudioEngine + AVAudioPlayerNode 播放 PCM
+//
+// 历史：AudioQueue 方案（预置 8 个 buffer + 回调重填）会把干净 PCM 弄坏
+// （实测入队缓冲出现 ±32768 削顶/错位数据）。AVAudioEngine 是拉取式渲染，
+// scheduleBuffer 由引擎按需消费，无字节对齐与缓冲复用问题，声音干净。
 // ============================================================================
 
 class MacAudioRenderer : public IAudioRenderer {
@@ -449,44 +454,27 @@ public:
         StopQueueLocked();
         cfg_ = config;
 
-        memset(&asbd_, 0, sizeof(asbd_));
-        asbd_.mSampleRate = (double)config.sample_rate;
-        asbd_.mChannelsPerFrame = config.channels;
-        asbd_.mFormatID = kAudioFormatLinearPCM;
-        asbd_.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
-        switch (config.format) {
-            case AudioFormat::PCM_FLOAT:
-                asbd_.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-                asbd_.mBitsPerChannel = 32;
-                break;
-            case AudioFormat::PCM24LE:
-                asbd_.mBitsPerChannel = 24;
-                break;
-            case AudioFormat::PCM32LE:
-                asbd_.mBitsPerChannel = 32;
-                break;
-            default: // PCM16LE
-                asbd_.mBitsPerChannel = 16;
-                break;
-        }
-        asbd_.mBytesPerFrame = (asbd_.mBitsPerChannel / 8) * config.channels;
-        asbd_.mBytesPerPacket = asbd_.mBytesPerFrame;
-        asbd_.mFramesPerPacket = 1;
-
-        OSStatus st = AudioQueueNewOutput(&asbd_, &MacAudioRenderer::StaticQueueCallback,
-                                          this, nullptr, nullptr, 0, &q_);
-        if (st != noErr) { q_ = nullptr; return Status::ERROR_CODEC; }
-
-        // 预分配 8 个 24ms buffer
-        uint32_t buf_bytes = (uint32_t)(config.sample_rate * asbd_.mBytesPerFrame * 24 / 1000);
-        if (buf_bytes < 4096) buf_bytes = 4096;
-        for (int i = 0; i < 8; ++i) {
-            AudioQueueBufferRef buf = nullptr;
-            if (AudioQueueAllocateBuffer(q_, buf_bytes, &buf) == noErr && buf) {
-                memset(buf->mAudioData, 0, buf_bytes);
-                buf->mAudioDataByteSize = buf_bytes;
-                AudioQueueEnqueueBuffer(q_, buf, 0, nullptr);
-            }
+        // 用 AVAudioEngine + AVAudioPlayerNode 播放：
+        //   - 拉取式渲染，无预置缓冲/字节对齐问题（AudioQueue 方案实测会破坏数据）
+        //   - 引擎自动处理采样率转换（44.1k → 设备原生速率）
+        // 注意：引擎 mixer 只接受 float32 非交错格式（int16 会报 -10868），
+        // 我们的 int16 交错 PCM 在 DrainLocked 里转成 float32。
+        engine_ = [[AVAudioEngine alloc] init];
+        player_ = [[AVAudioPlayerNode alloc] init];
+        [engine_ attachNode:player_];
+        fmt_ = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
+                                                sampleRate:config.sample_rate
+                                                  channels:config.channels
+                                               interleaved:NO];
+        [engine_ connect:player_ to:engine_.mainMixerNode format:fmt_];
+        NSError* err = nil;
+        if (![engine_ startAndReturnError:&err]) {
+            fprintf(stderr, "[Audio] AVAudioEngine start failed: %s\n",
+                    err.localizedDescription.UTF8String);
+            engine_ = nil;
+            player_ = nil;
+            fmt_ = nil;
+            return Status::ERROR_CODEC;
         }
         configured_ = true;
         return Status::OK;
@@ -496,14 +484,18 @@ public:
                   uint64_t timestamp_us) override {
         (void)timestamp_us;
         std::lock_guard<std::mutex> lk(mu_);
-        if (!configured_ || !q_ || !pcm_data || num_bytes == 0) return Status::OK;
+        if (!configured_ || !player_ || !pcm_data || num_bytes == 0) return Status::OK;
         pcm_bytes_total_ += num_bytes; // UI 统计：累计解码出的 PCM 字节数
         pending_.insert(pending_.end(), pcm_data, pcm_data + num_bytes);
-        // 限制缓存上限（200ms），避免镜像延迟无限增长
-        size_t max_pending = (size_t)(cfg_.sample_rate * asbd_.mBytesPerFrame * 200 / 1000);
-        if (pending_.size() > max_pending) {
-            pending_.erase(pending_.begin(), pending_.begin() + (pending_.size() - max_pending));
+        // 限制缓存上限（200ms），避免延迟无限增长
+        size_t bpf = BytesPerFrameLocked();
+        if (bpf > 0) {
+            size_t max_pending = (size_t)(cfg_.sample_rate * bpf * 200 / 1000);
+            if (pending_.size() > max_pending) {
+                pending_.erase(pending_.begin(), pending_.begin() + (pending_.size() - max_pending));
+            }
         }
+        DrainLocked();
         return Status::OK;
     }
 
@@ -569,23 +561,34 @@ public:
         // 攒够一批再解码：AudioConverter 的 AAC 解码器有 1 帧 lookahead，
         // 单包一次调用会产生 0 输出（实测），批量喂 4 个包即可稳定输出。
         aac_batch_.push_back(std::vector<uint8_t>(data, data + len));
-        if (aac_batch_.size() >= kAacBatchSize) DrainAacBatchLocked();
+        if (aac_batch_.size() >= kAacBatchSize) {
+            DrainAacBatchLocked();
+            DrainLocked();
+        }
         return Status::OK;
     }
 
     void on_play() override {
         std::lock_guard<std::mutex> lk(mu_);
-        if (q_ && !playing_) { AudioQueueStart(q_, nullptr); playing_ = true; }
+        if (player_ && !playing_) {
+            [player_ play];
+            playing_ = true;
+            DrainLocked();
+        }
     }
     void on_pause() override {
         std::lock_guard<std::mutex> lk(mu_);
-        if (q_ && playing_) { AudioQueuePause(q_); playing_ = false; }
+        if (player_ && playing_) {
+            [player_ pause];
+            playing_ = false;
+        }
     }
     void on_flush() override {
         std::lock_guard<std::mutex> lk(mu_);
         // 先把攒的 AAC 包解出来，避免 FLUSH 丢尾音
         DrainAacBatchLocked();
-        if (q_) AudioQueueFlush(q_);
+        DrainLocked();
+        if (player_) [player_ stop];   // 清空已调度的缓冲
         pending_.clear();
         aac_batch_.clear();
     }
@@ -598,7 +601,7 @@ public:
     void set_volume(float v) override {
         std::lock_guard<std::mutex> lk(mu_);
         volume_ = v;
-        if (q_) AudioQueueSetParameter(q_, kAudioQueueParam_Volume, v);
+        if (player_) player_.volume = v;
     }
 
     /// UI 统计：累计收到的 PCM 字节数
@@ -606,18 +609,19 @@ public:
     /// UI 统计：累计收到的 AAC 压缩包数 / 字节数
     uint64_t aac_packets() const { return aac_packets_.load(); }
     uint64_t aac_bytes_total() const { return aac_bytes_total_.load(); }
-    /// UI 统计：当前队列状态（非 const：内部要加锁）
+    /// UI 统计：当前播放状态（非 const：内部要加锁）
     bool queue_active() {
         std::lock_guard<std::mutex> lk(mu_);
-        return configured_ && q_ && playing_;
+        return configured_ && engine_ && player_ && playing_;
     }
 
 private:
-    AudioQueueRef q_ = nullptr;
-    AudioStreamBasicDescription asbd_{};
+    AVAudioEngine* engine_ = nil;       ///< 引擎（自动做采样率转换）
+    AVAudioPlayerNode* player_ = nil;   ///< 播放节点（拉取式）
+    AVAudioFormat* fmt_ = nil;          ///< 输入格式：交错 int16 PCM
     AudioConfig cfg_;
     std::mutex mu_;
-    // 注意：必须用连续存储（vector 而非 deque）——FillBuffer 会对
+    // 注意：必须用连续存储（vector 而非 deque）——DrainLocked 会对
     // &pending_[0] 直接 memcpy n 字节；deque 的块存储不连续，跨块读取
     // 会越界（ASan: heap-buffer-overflow）
     std::vector<uint8_t> pending_;
@@ -639,7 +643,7 @@ private:
     std::atomic<uint64_t> aac_bytes_total_{0};
     std::atomic<uint64_t> aac_decode_errors_{0};
 
-    // 批量解码输入状态：把所有 AU 拼成一个连续缓冲，回调按 AU 逐个喂
+    // ---- 批量解码输入状态：把所有 AU 拼成一个连续缓冲，回调按 AU 逐个喂 ----
     struct AacBatchState {
         const uint8_t* data = nullptr;   // 连续 AU 数据
         std::vector<size_t> au_offsets;  // 每个 AU 在 data 中的偏移
@@ -747,10 +751,54 @@ private:
             }
             if (st.idx >= offsets.size() && produced == 0) break;
         }
-        // 限制缓存上限（200ms），避免镜像延迟无限增长
-        size_t max_pending = (size_t)(cfg_.sample_rate * asbd_.mBytesPerFrame * 200 / 1000);
-        if (max_pending > 0 && pending_.size() > max_pending) {
-            pending_.erase(pending_.begin(), pending_.begin() + (pending_.size() - max_pending));
+        // 限制缓存上限（200ms），避免延迟无限增长
+        size_t bpf = BytesPerFrameLocked();
+        if (bpf > 0) {
+            size_t max_pending = (size_t)(cfg_.sample_rate * bpf * 200 / 1000);
+            if (max_pending > 0 && pending_.size() > max_pending) {
+                pending_.erase(pending_.begin(), pending_.begin() + (pending_.size() - max_pending));
+            }
+        }
+    }
+
+    /*! 当前每帧字节数（PCM16 交错；调用方必须已持有 mu_） */
+    size_t BytesPerFrameLocked() const {
+        return (size_t)cfg_.channels * 2;  // 16-bit 输出
+    }
+
+    /*!
+     * @brief 把 pending_ 里的 PCM 分块调度给 AVAudioPlayerNode（拉取式播放）
+     *
+     * 每 40ms 一块（帧对齐），由引擎的播放线程按需拉取；不涉及
+     * 预置缓冲/字节对齐/回调重入，规避 AudioQueue 方案的数据破坏问题。
+     * 调用方必须已持有 mu_。
+     */
+    void DrainLocked() {
+        if (!configured_ || !player_ || !fmt_) return;
+        size_t bpf = BytesPerFrameLocked();
+        if (bpf == 0) return;
+        const size_t kChunkFrames = (size_t)(cfg_.sample_rate * 40 / 1000);  // 40ms
+        const size_t kChunkBytes = kChunkFrames * bpf;
+        while (pending_.size() >= kChunkBytes) {
+            uint32_t frames = (uint32_t)kChunkFrames;
+            AVAudioPCMBuffer* buf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:fmt_
+                                                                  frameCapacity:frames];
+            if (!buf) break;
+            buf.frameLength = frames;
+            // 转换：交错 int16 → 非交错 float32（引擎 mixer 需要的格式）。
+            // audioBufferList 声明为 const，但 mData 指向的缓冲本身可写
+            // （AVAudioPCMBuffer 的标准填法）。
+            AudioBufferList* abl = (AudioBufferList*)buf.audioBufferList;
+            for (uint32_t c = 0; c < (uint32_t)cfg_.channels; ++c) {
+                float* dst = (float*)abl->mBuffers[c].mData;
+                for (uint32_t f = 0; f < frames; ++f) {
+                    int16_t v;
+                    memcpy(&v, pending_.data() + ((size_t)f * cfg_.channels + c) * 2, 2);
+                    dst[f] = (float)v / 32768.0f;
+                }
+            }
+            pending_.erase(pending_.begin(), pending_.begin() + kChunkBytes);
+            [player_ scheduleBuffer:buf completionHandler:nil];
         }
     }
 
@@ -762,36 +810,15 @@ private:
         }
     }
 
-    static void StaticQueueCallback(void* user, AudioQueueRef aq, AudioQueueBufferRef buf) {
-        static_cast<MacAudioRenderer*>(user)->FillBuffer(aq, buf);
-    }
-
-    void FillBuffer(AudioQueueRef aq, AudioQueueBufferRef buf) {
-        std::lock_guard<std::mutex> lk(mu_);
-        // 若还有攒下的 AAC 包，优先解码（backpressure：队列快空时补上）
-        if (!aac_batch_.empty() && pending_.empty()) DrainAacBatchLocked();
-        size_t cap = buf->mAudioDataBytesCapacity;
-        size_t n = std::min(cap, pending_.size());
-        if (n > 0) {
-            memcpy(buf->mAudioData, pending_.data(), n);
-            pending_.erase(pending_.begin(), pending_.begin() + n);
-        } else {
-            memset(buf->mAudioData, 0, cap);
-            n = cap;
-        }
-        buf->mAudioDataByteSize = (UInt32)n;
-        AudioQueueEnqueueBuffer(aq, buf, 0, nullptr);
-    }
-
     void StopQueueLocked() {
         configured_ = false;
         pending_.clear();
         aac_batch_.clear();
-        if (q_) {
-            AudioQueueStop(q_, true);
-            AudioQueueDispose(q_, true);
-            q_ = nullptr;
-        }
+        if (player_) [player_ stop];
+        if (engine_) [engine_ stop];
+        engine_ = nil;
+        player_ = nil;
+        fmt_ = nil;
         playing_ = false;
         StopAacLocked();
     }
@@ -827,10 +854,12 @@ static std::atomic<bool> g_running{true};
     std::string pin_;
     std::string model_;
     std::string keyfile_;
+    bool audio_test_;   // --audiotest：只测 AudioQueue 渲染路径（本地正弦波）
 }
 
 - (instancetype)initWithName:(std::string)name port:(uint16_t)port pin:(std::string)pin
-                       model:(std::string)model keyfile:(std::string)keyfile {
+                       model:(std::string)model keyfile:(std::string)keyfile
+                   audioTest:(bool)audio_test {
     self = [super init];
     if (self) {
         device_name_ = std::move(name);
@@ -838,6 +867,7 @@ static std::atomic<bool> g_running{true};
         pin_ = std::move(pin);
         model_ = std::move(model);
         keyfile_ = std::move(keyfile);
+        audio_test_ = audio_test;
     }
     return self;
 }
@@ -936,8 +966,50 @@ static std::atomic<bool> g_running{true};
 
     // 捕获 strong self：demo 进程生命周期 = app 生命周期，无循环引用问题
     std::thread([self] {
-        [self server_thread];
+        if (self->audio_test_) {
+            [self audio_test_thread];
+        } else {
+            [self server_thread];
+        }
     }).detach();
+}
+
+// --audiotest：绕过整个网络/解码链路，用同一个 MacAudioRenderer(AudioQueue)
+// 播放一段本地生成的 440Hz 正弦波。若这段也"杂音"→ 渲染器有 bug（本地可修）；
+// 若干净 → 噪音来自网络/解码/管线，继续往上游查。
+- (void)audio_test_thread {
+    __strong MirrorAppDelegate* strongSelf = self;
+    AudioConfig cfg;
+    cfg.sample_rate = 44100;
+    cfg.channels = 2;
+    cfg.format = AudioFormat::PCM16LE;
+    cfg.frame_size = 882;
+    g_audio->on_config(cfg);
+    g_audio->on_play();
+
+    const int kSeconds = 4;
+    const double freq = 440.0;
+    std::vector<uint8_t> chunk;  // 20ms PCM
+    chunk.reserve(44100 * 4 * 20 / 1000);
+    double phase = 0.0;
+    // 以 2 倍实时速率喂数据（每 10ms 喂 20ms），保证 pending_ 永远不空，
+    // 排除"欠载导致补零"这一干扰因素，只测渲染路径本身。
+    for (int i = 0; i < kSeconds * 100; ++i) {
+        chunk.clear();
+        for (int f = 0; f < 882; ++f) {
+            int16_t v = (int16_t)(std::sin(phase) * 12000.0);
+            phase += 2.0 * M_PI * freq / 44100.0;
+            if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
+            chunk.push_back((uint8_t)(v & 0xFF));
+            chunk.push_back((uint8_t)((uint16_t)v >> 8));
+            chunk.push_back((uint8_t)(v & 0xFF));   // L/R 同相
+            chunk.push_back((uint8_t)((uint16_t)v >> 8));
+        }
+        g_audio->on_pcm(chunk.data(), chunk.size(), 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    [strongSelf setStatus:@"--audiotest 播放结束（440Hz 正弦波 4 秒）"];
+    g_audio->on_stop();
 }
 
 - (void)windowDidResize:(NSNotification*)note {
@@ -1167,7 +1239,8 @@ static void print_help(const char* argv0) {
     printf("                         AppleTV11,1       = Apple TV 4K\n");
     printf("                         AudioAccessory1,2 = speaker (HomePod)\n");
     printf("                         AudioAccessory5,1 = speaker (HomePod mini)\n");
-    printf("  -h, --help           Show help\n");
+    printf("  -t, --audiotest        AudioQueue 渲染自检：本地播放 440Hz 正弦波 4 秒\n");
+    printf("  -h, --help             Show help\n");
 }
 
 int main(int argc, const char** argv) {
@@ -1176,6 +1249,7 @@ int main(int argc, const char** argv) {
     std::string pin;
     std::string keyfile;
     std::string model = "MacBookPro18,3";  // 默认：电脑图标
+    bool audio_test = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1187,13 +1261,15 @@ int main(int argc, const char** argv) {
         else if (arg == "-k" || arg == "--pin") pin = next();
         else if (arg == "-K" || arg == "--keyfile") keyfile = next();
         else if (arg == "-m" || arg == "--model") model = next();
+        else if (arg == "-t" || arg == "--audiotest") audio_test = true;
         else if (arg == "-h" || arg == "--help") { print_help(argv[0]); return 0; }
     }
 
     @autoreleasepool {
         NSApplication* app = [NSApplication sharedApplication];
         g_delegate = [[MirrorAppDelegate alloc] initWithName:name port:port pin:pin
-                                                       model:model keyfile:keyfile];
+                                                       model:model keyfile:keyfile
+                                                   audioTest:audio_test];
         [app setDelegate:g_delegate];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
         [app run];

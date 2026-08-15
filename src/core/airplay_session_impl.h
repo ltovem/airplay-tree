@@ -143,7 +143,6 @@ private:
     codec::AudioBuffer pcm_buffer_;
     AudioConfig audio_cfg_;
     std::string codec_mode_;
-    int alac_debug_dump_ = 0;   ///< 临时调试：已打印解密帧头的包数（验证解密用）
     std::atomic<bool> playing_{false};
     std::atomic<bool> video_playing_{false};
 
