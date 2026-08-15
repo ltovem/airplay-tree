@@ -56,6 +56,14 @@ public:
     void configure_audio(const net::SdpInfo& sdp);
     void configure_video(const net::SdpInfo& sdp);
 
+    /// 配置 AP2 音频（type=96 流的 SETUP，无 ANNOUNCE 时使用）。
+    /// AP2 纯音频没有 SDP，编解码信息全在 SETUP stream dict：
+    ///   ct=2 → ALAC（spf=352）；ct=8 → AAC-ELD（压缩透传给渲染器）。
+    /// @param ct  codec type（UxPlay audio_get_format 同款映射）
+    /// @param spf samples per frame
+    /// @param sr  采样率（缺失为 0 → 默认 44100）
+    void configure_ap2_audio(uint64_t ct, uint64_t spf, uint64_t sr);
+
     /// Start both streams (RECORD response)
     void start_streaming();
     /// Start only video stream (data push without audio)

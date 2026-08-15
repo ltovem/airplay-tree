@@ -132,14 +132,55 @@ void SessionImpl::configure_audio(const net::SdpInfo& sdp) {
             }
         } else if (lower.find("l16") != std::string::npos || lower == "pcm") {
             audio_cfg_.format = AudioFormat::PCM16LE;
-        } else if (lower.find("mpeg4") != std::string::npos || lower == "aac") {
-            // For AAC: output PCM16 stub (user can extend with external decoder)
-            audio_cfg_.format = AudioFormat::PCM16LE;
+        } else if (lower.find("mpeg4") != std::string::npos || lower.find("aac") != std::string::npos) {
+            // AAC / AAC-ELD：压缩帧原样透传给渲染器解码（demo 用 AudioConverter）。
+            // fmtp 里带 config= AudioSpecificConfig，渲染器需要它来建解码器。
+            codec_mode_ = "mpeg4-generic";
+            audio_cfg_.format = AudioFormat::AAC_ELD;
+            if (audio_renderer_) {
+                audio_renderer_->on_compressed_config(codec_mode_, sdp.fmtp, audio_cfg_);
+            }
         }
     }
     pcm_buffer_.set_config(audio_cfg_);
     if (audio_renderer_) audio_renderer_->on_config(audio_cfg_);
     transition(AirPlaySession::State::READY);
+}
+
+void SessionImpl::configure_ap2_audio(uint64_t ct, uint64_t spf, uint64_t sr) {
+    // AP2 纯音频（音乐投送）没有 ANNOUNCE，编解码参数全在 SETUP stream dict：
+    //   ct=2 → ALAC（spf=352，44.1kHz）；ct=8 → AAC-ELD（镜像音频，压缩透传）。
+    // 与 UxPlay raop_handler_setup case 96 + audio_get_format 的映射一致。
+    audio_cfg_.sample_rate = (sr > 0) ? (uint32_t)sr : 44100;
+    audio_cfg_.channels    = 2;
+    first_sample_rate_     = audio_cfg_.sample_rate;
+
+    if (ct == 2) {
+        codec_mode_ = "alac";
+        codec::AlacMagicCookie cookie;
+        cookie.sample_rate  = audio_cfg_.sample_rate;
+        cookie.num_channels = audio_cfg_.channels;
+        cookie.bit_depth    = 16;
+        cookie.frame_length = (spf > 0) ? (int)spf : 4096;
+        alac_.configure(cookie);
+        audio_cfg_ = alac_.output_config();
+    } else {
+        // AAC-ELD / 其他：压缩帧透传给渲染器（demo 的 AudioConverter 解码）
+        codec_mode_ = "mpeg4-generic";
+        audio_cfg_.format = AudioFormat::AAC_ELD;
+        if (audio_renderer_) {
+            audio_renderer_->on_compressed_config(codec_mode_, "", audio_cfg_);
+        }
+    }
+    pcm_buffer_.set_config(audio_cfg_);
+    if (audio_renderer_) audio_renderer_->on_config(audio_cfg_);
+    // AP2 里 RECORD 可能先于带流 SETUP 到达：播放已启动但渲染队列尚未创建，
+    // 这里补一次 on_play，否则 AudioQueue 建好后永远不 start → 没声音。
+    if (playing_.load() && audio_renderer_) audio_renderer_->on_play();
+    AP2_LOGI("session %lu: AP2 audio ct=%llu spf=%llu sr=%llu -> %s (out %u Hz %u ch)",
+             (unsigned long)id_, (unsigned long long)ct, (unsigned long long)spf,
+             (unsigned long long)sr, codec_mode_.c_str(),
+             audio_cfg_.sample_rate, audio_cfg_.channels);
 }
 
 void SessionImpl::start_streaming() {
@@ -218,6 +259,9 @@ void SessionImpl::on_rtp_packet(const net::RtpAudioPacket& pkt) {
 
     if (alac_.is_configured() &&
         (lower_mode.find("applelossless") != std::string::npos || lower_mode == "alac")) {
+        // UxPlay：ALAC 流开始时会先发几个 44 字节包（12B RTP 头 + 32B 加密负载），
+        // 解密后是 ALAC 格式信息而非音频数据，必须跳过，否则解码器会报错刷屏。
+        if (pkt.payload.size() == 32) return;
         int64_t used = alac_.decode_frame(pkt.payload.data(), pkt.payload.size(), pcm);
         if (used < 0) {
             AP2_LOGW("session %lu: alac decode failed", (unsigned long)id_);
@@ -225,6 +269,15 @@ void SessionImpl::on_rtp_packet(const net::RtpAudioPacket& pkt) {
         }
         (void)used;
         samples = pcm_buffer_.write_bytes(pcm.data(), pcm.size());
+    } else if (lower_mode.find("mpeg4") != std::string::npos ||
+               lower_mode.find("aac") != std::string::npos) {
+        // AAC-ELD / AAC：压缩帧原样透传给渲染器（demo 用 AudioConverter 解码），
+        // 不走 PCM 缓冲。未配置解码器时渲染器内部会丢弃。
+        if (audio_renderer_) {
+            audio_renderer_->on_compressed_audio(pkt.payload.data(), pkt.payload.size(),
+                                                 pkt.recv_us);
+        }
+        return;
     } else if (lower_mode.find("l16") != std::string::npos || lower_mode == "pcm") {
         // Raw PCM 16-bit big-endian? AirPlay L16 is usually BE.
         pcm = pkt.payload;

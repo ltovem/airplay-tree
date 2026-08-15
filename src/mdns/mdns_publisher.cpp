@@ -349,23 +349,20 @@ void MdnsPublisher::send_announcements(bool goodbye) {
         if (model.empty()) model = device_.supports_video ? "AppleTV6,2" : "AudioAccessory1,2";
 
         txt["deviceid"]  = device_.device_id;
-        txt["features"]  = format_features(device_.features);
+        // features 发布"双字"格式（UxPlay dnssd 同款："0x5A7FFEE6,0x0"）。
+        // 第二字全 0 也要显式写出，部分 iOS 版本按完整 64 位解析，缺失会
+        // 把设备误判成纯音频 → 镜像栏显示音响图标、无法镜像。
+        txt["features"]  = format_features(device_.features) + ",0x0";
         txt["model"]     = model;
-        txt["srcvers"]   = "605.30.1";
+        txt["srcvers"]   = "220.68";   // 对齐 UxPlay GLOBAL_VERSION（Apple TV 3 同款）
         txt["vv"]        = device_.supports_video ? "2" : "1"; // vv=2 显示支持视频
-        txt["vn"]        = "65537";
-        txt["os"]        = "13.4.1";
         txt["pk"]        = device_.public_key_b64; // Ed25519 公钥(base64)，iOS 配对必需
         txt["pi"]        = device_.device_id;
-        // flags=状态位图(20bit)。0x84 对齐 UxPlay AIRPLAY_FLAGS，
-        // 让 iOS 正确归类设备能力（是否播放中/是否支持遥控等）。
-        txt["flags"]     = "0x84";
-        if (device_.supports_video) {
-            txt["tvOSVersion"]     = "13.4.1";
-            txt["acl"]             = "0";
-            txt["atm"]             = "RXVhQ2FzdGU=";
-            txt["cvs"]             = "1";
-        }
+        // pw=是否需要密码。空 PIN 时 false（UxPlay 同款：无密码也要显式声明）
+        txt["pw"]        = device_.requires_encryption ? "true" : "false";
+        // flags=状态位图(20bit)。UxPlay 用 0x4（"ready"），不是 0x84；
+        // 0x80 位可能被 iOS 解读为"需要密码"，导致镜像拒绝。
+        txt["flags"]     = "0x4";
 
         auto pkt = build_service_record(device_.name, "_airplay._tcp", "local",
                                         device_.port, txt, kTtlDefault, goodbye, adv_ip_);
@@ -398,6 +395,13 @@ void MdnsPublisher::send_announcements(bool goodbye) {
         txt["txtvers"]   = "1";          // TXT record 版本（_raop 标准字段）
         txt["sf"]        = "0x4";        // sender features（对齐 UxPlay RAOP_SF）
         txt["sv"]        = "false";      // 是否"软件设备"（对齐 UxPlay RAOP_SV）
+        // 对齐 UxPlay dnssd_register_raop：am=设备型号 / ft=features / vs=版本
+        // / rhd=硬件版本。这些字段帮助 iOS 正确归类设备能力（音频/镜像）。
+        txt["am"]        = device_.model.empty() ? "AppleTV3,2" : device_.model;
+        txt["ft"]        = format_features(device_.features) + ",0x0";
+        txt["vs"]        = "220.68";
+        txt["rhd"]       = "5.6.0.0";
+        txt["pk"]        = device_.public_key_b64;
 
         auto pkt = build_service_record(devid + "@" + device_.name, "_raop._tcp", "local",
                                         device_.port, txt, kTtlDefault, goodbye, adv_ip_);
@@ -464,21 +468,16 @@ bool MdnsPublisher::register_with_bonjour() {
     std::string model = device_.model;
     if (model.empty()) model = device_.supports_video ? "AppleTV6,2" : "AudioAccessory1,2";
     txt["deviceid"] = device_.device_id;
-    txt["features"] = format_features(device_.features);
+    // 与 UDP 路径一致：双字 features / flags=0x4 / srcvers=220.68 / pw，
+    // 保证两种后端宣告出去的能力完全一致（iOS 按 64 位解析 features）。
+    txt["features"] = format_features(device_.features) + ",0x0";
     txt["model"]    = model;
-    txt["srcvers"]  = "605.30.1";
+    txt["srcvers"]  = "220.68";
     txt["vv"]       = device_.supports_video ? "2" : "1";
-    txt["vn"]       = "65537";
-    txt["os"]       = "13.4.1";
     txt["pk"]       = device_.public_key_b64; // Ed25519 公钥(base64)，iOS 配对必需
     txt["pi"]       = device_.device_id;
-    txt["flags"]    = "0x84"; // 对齐 UxPlay AIRPLAY_FLAGS，见 send_announcements() 注释
-    if (device_.supports_video) {
-        txt["tvOSVersion"] = "13.4.1";
-        txt["acl"]         = "0";
-        txt["atm"]         = "RXVhQ2FzdGU=";
-        txt["cvs"]         = "1";
-    }
+    txt["pw"]       = device_.requires_encryption ? "true" : "false";
+    txt["flags"]    = "0x4";
     auto blob = build_txt_blob(txt);
 
     // host=NULL：让 mDNSResponder 用本机主机名作为 SRV target，A 记录自动解析
@@ -518,6 +517,12 @@ bool MdnsPublisher::register_with_bonjour() {
     rtxt["txtvers"] = "1";  // _raop 标准字段，与 UDP 路径保持一致
     rtxt["sf"] = "0x4";     // sender features（对齐 UxPlay RAOP_SF）
     rtxt["sv"] = "false";   // 对齐 UxPlay RAOP_SV
+    // 对齐 UxPlay dnssd_register_raop 的 am/ft/vs/rhd/pk
+    rtxt["am"] = device_.model.empty() ? "AppleTV3,2" : device_.model;
+    rtxt["ft"] = format_features(device_.features) + ",0x0";
+    rtxt["vs"] = "220.68";
+    rtxt["rhd"] = "5.6.0.0";
+    rtxt["pk"] = device_.public_key_b64;
     auto rblob = build_txt_blob(rtxt);
     err = DNSServiceRegister(
         &raop_ref_, 0, 0, (devid + "@" + device_.name).c_str(),

@@ -88,8 +88,9 @@ struct Ap2StreamReq {
     uint64_t type = 0;                  ///< 流类型：96 audio / 110 mirroring
     uint64_t control_port = 0;          ///< audio：客户端控制(RTCP)端口
     uint64_t stream_connection_id = 0;  ///< mirroring/video：流连接 ID（视频密钥派生用）
-    uint64_t ct = 0;                    ///< audio codec type
-    uint64_t spf = 0;                   ///< samples per frame
+    uint64_t ct = 0;                    ///< audio codec type（2=ALAC 8=AAC-ELD，UxPlay 同款）
+    uint64_t spf = 0;                   ///< samples per frame（ALAC=352）
+    uint64_t sr = 0;                    ///< 采样率（ALAC=44100；缺失时默认 44100）
 };
 
 /*!

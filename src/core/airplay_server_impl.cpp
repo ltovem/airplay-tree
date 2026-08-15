@@ -232,6 +232,9 @@ net::Ap2SetupResponse ServerImpl::on_setup_ap2(uint64_t conn_id,
         if (s.type == 96) {
             have_audio = true;
             remote[1] = (int)s.control_port; // 客户端 RTCP 端口
+            // AP2 音频没有 ANNOUNCE：codec 信息（ct/spf/sr）在 stream dict 里，
+            // 这里必须配置好 ALAC/AAC，否则渲染器/解码器永远不初始化。
+            sess->configure_ap2_audio(s.ct, s.spf, s.sr);
             break;
         }
     }

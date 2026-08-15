@@ -92,7 +92,9 @@ public:
     /// 注册音频包回调；建议在 start() 之前或 PLAYING 状态切换之外调用
     void set_packet_callback(AudioPacketCb cb) { packet_cb_ = std::move(cb); }
 
-    /// 启动接收线程（open 之后才能调）；重复调用安全
+    /// 启动接收线程（open 之后才能调）；重复调用安全。
+    /// 若 open() 尚未执行（AP2 里带流的 SETUP 可能晚于 RECORD 到达），
+    /// 会延迟到 open() 绑定端口成功后自动拉起线程。
     bool start();
 
     /// 停止并关闭三个 UDP socket；会把端口立即还给系统
@@ -193,6 +195,9 @@ private:
     platform::Socket timing_sock_;  ///< port3: AirPlay timing（UDP）
     platform::Thread worker_;       ///< 接收线程
     std::atomic<bool> running_{false};
+    // start() 在端口绑定前被调用时置位；open() 绑定成功后会自动补启动。
+    // 只在 RTSP 连接线程（SETUP/RECORD/TEARDOWN handler）里读写，无需加锁。
+    bool start_deferred_ = false;
     AudioPacketCb packet_cb_;       ///< 有序输出回调（无锁，只在 worker 访问）
 
     // ---- 远端地址（发 RR / timing response 用）--------------------------------

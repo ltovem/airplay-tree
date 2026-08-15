@@ -52,6 +52,11 @@ bool VideoRtpReceiver::open(uint16_t data_port_min, uint16_t data_port_max,
         if (s.bind("0.0.0.0", (uint16_t)p)) {
             data_sock_ = std::move(s);
             out_data_port = (uint16_t)p;
+            // start() 在绑定前被调用过（RECORD 早于镜像 SETUP）→ 补启动
+            if (start_deferred_) {
+                start_deferred_ = false;
+                start();
+            }
             return true;
         }
     }
@@ -59,14 +64,24 @@ bool VideoRtpReceiver::open(uint16_t data_port_min, uint16_t data_port_max,
 }
 
 void VideoRtpReceiver::start() {
+    if (!data_sock_.valid()) {
+        // 端口还没绑定：记下延迟启动请求，open() 成功后自动拉起。
+        start_deferred_ = true;
+        return;
+    }
+    start_deferred_ = false;
     if (running_.exchange(true)) return;
     worker_.start([this] { receiver_worker(); }, "ap2-video");
 }
 
 void VideoRtpReceiver::stop() {
-    if (!running_.exchange(false)) return;
+    start_deferred_ = false;
+    if (running_.exchange(false)) {
+        data_sock_.close();   // 先关 socket 让 select 立即返回，再 join
+        worker_.stop_and_join();
+        return;
+    }
     data_sock_.close();
-    worker_.stop_and_join();
 }
 
 void VideoRtpReceiver::receiver_worker() {

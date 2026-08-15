@@ -272,7 +272,7 @@ std::string RtspServer::build_info_plist(const DeviceInfo& dev) {
     kv("manufacturer", dev.manufacturer);
     if (!dev.serial_number.empty()) kv("serialNumber", dev.serial_number);
     kv("protocolVersion", "1.1");
-    kv("srcvers", "605.30.1");
+    kv("srcvers", "220.68");
     kv("pi", dev.device_id);
     kvi("vv", 2);                 // AirPlay 2
     kvi("statusFlags", 68);       // 0x44，对齐 UxPlay（表示支持音量控制等）
@@ -474,6 +474,7 @@ void RtspServer::install_routes(const DeviceInfo& dev) {
                     sr.stream_connection_id = (uint64_t)s.get_int("streamConnectionID");
                     sr.ct = (uint64_t)s.get_int("ct");
                     sr.spf = (uint64_t)s.get_int("spf");
+                    sr.sr  = (uint64_t)s.get_int("sr");
                     ap2req.streams.push_back(sr);
                 }
             }
@@ -481,10 +482,11 @@ void RtspServer::install_routes(const DeviceInfo& dev) {
                      ap2req.streams.size(), (unsigned long long)ap2req.timing_port,
                      ap2req.timing_protocol.c_str(), ap2req.ekey.size(), ap2req.eiv.size());
             for (auto& s : ap2req.streams)
-                AP2_LOGI("rtsp:   stream type=%llu controlPort=%llu streamConnectionID=%llu ct=%llu spf=%llu",
+                AP2_LOGI("rtsp:   stream type=%llu controlPort=%llu streamConnectionID=%llu ct=%llu spf=%llu sr=%llu",
                          (unsigned long long)s.type, (unsigned long long)s.control_port,
                          (unsigned long long)s.stream_connection_id,
-                         (unsigned long long)s.ct, (unsigned long long)s.spf);
+                         (unsigned long long)s.ct, (unsigned long long)s.spf,
+                         (unsigned long long)s.sr);
 
             Ap2SetupResponse resp;
             if (handlers_.on_setup_ap2) resp = handlers_.on_setup_ap2(c.id(), ap2req);

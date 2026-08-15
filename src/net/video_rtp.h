@@ -54,7 +54,8 @@ public:
     /// 可传 -1 表示不绑定，由外部管理）。返回 true 成功
     bool open(uint16_t data_port_min, uint16_t data_port_max, uint16_t& out_data_port);
 
-    /// 启动后台收包线程
+    /// 启动后台收包线程。若端口尚未绑定（AP2 中 RECORD 可能早于镜像 SETUP），
+    /// 会延迟到 open() 成功后自动启动。
     void start();
     /// 停止线程并关闭 socket
     void stop();
@@ -90,6 +91,8 @@ private:
     int sender_port_ = 0;
 
     std::atomic<bool> running_{false};
+    // start() 在端口绑定前被调用时置位；open() 绑定成功后自动补启动。
+    bool start_deferred_ = false;
     platform::Thread worker_;
     std::mutex mu_;
 

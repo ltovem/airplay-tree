@@ -44,19 +44,33 @@ bool RtpReceiver::open(uint16_t port_min, uint16_t port_max, int ports[3]) {
     timing_sock_ = std::move(tmp[2]);
     for (int i = 0; i < 3; ++i) ports[i] = bound[i];
     AP2_LOGI("rtp: bound ports %d-%d-%d", bound[0], bound[1], bound[2]);
+    // 若 start() 在端口绑定前就被调用过（AP2：RECORD 早于带流 SETUP），
+    // 现在端口就绪，补上收包线程。
+    if (start_deferred_) {
+        start_deferred_ = false;
+        start();
+    }
     return true;
 }
 
 bool RtpReceiver::start() {
-    if (!data_sock_.valid()) return false;
-    running_.store(true);
+    if (!data_sock_.valid()) {
+        // 端口还没绑定：记下延迟启动请求，等 open() 成功后自动拉起。
+        start_deferred_ = true;
+        return true;
+    }
+    start_deferred_ = false;
+    if (running_.exchange(true)) return true;
     worker_.start([this] { receiver_worker(); }, "ap2-rtp");
     return true;
 }
 
 void RtpReceiver::stop() {
-    if (!running_.exchange(false)) return;
-    worker_.stop_and_join();
+    start_deferred_ = false;
+    if (running_.exchange(false)) {
+        worker_.stop_and_join();
+    }
+    // 即使从未真正启动（延迟启动期间被 TEARDOWN），也要关掉已绑定的 socket。
     data_sock_.close();
     ctrl_sock_.close();
     timing_sock_.close();
