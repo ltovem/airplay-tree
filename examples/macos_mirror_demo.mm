@@ -601,7 +601,12 @@ static std::atomic<bool> g_running{true};
     AirPlayServer server(cfg, std::move(cbs), g_audio, g_video);
     Status rc = server.start();
     if (rc != Status::OK) {
-        std::string text = "启动失败: " + std::to_string((int)rc);
+        // -5 端口被占用：最常见原因是上一个实例未退出，先退出再启动
+        std::string text = "启动失败: " + std::to_string((int)rc) +
+                           (rc == Status::ERROR_BIND_FAILED
+                                ? " (端口 " + std::to_string(port_) +
+                                      " 被占用，请先退出已运行的实例再启动)"
+                                : "");
         [strongSelf setStatus:[NSString stringWithUTF8String:text.c_str()]];
         AirPlayServer::global_cleanup();
         return;
