@@ -1,15 +1,14 @@
 /*!
  * @file alac_decoder.h
- * @brief Apple Lossless Audio Codec decoder implementation
+ * @brief Apple Lossless (ALAC) 解码器封装
  *
- * This implements the publicly documented ALAC bitstream format:
- *   - 32-bit predictor / LPC coefficient set
- *   - Rice parameter coding of residuals
- *   - Dynamic frame size support (up to 4096 samples per frame)
- *   - Support for 16/20/24/32-bit PCM, stereo / mono, 44.1/48 kHz
+ * 内部直接使用 Apple 官方开源实现（macosforge/alac，Apache-2.0，
+ * 代码 vendored 在 src/codec/alac/ 下）：ALACDecoder 是 Apple 参考解码器，
+ * 与 iOS/Apple TV 的编码端保证互操作。此前自研解码器对真实 iOS 帧
+ * 解码输出为噪音，故整体替换为官方实现。
  *
- * Reference: Apple's open-source "Apple Lossless" codec, RFC-style specs
- * available from alac.co.uk and the alac-encoder/decoder GitHub projects.
+ * 解码流程：
+ *   RTP 负载（已 AES-CBC 解密）→ Apple ALACDecoder::Decode() → PCM16LE
  */
 #ifndef AIRPLAY2_ALAC_DECODER_H
 #define AIRPLAY2_ALAC_DECODER_H
@@ -17,19 +16,19 @@
 #include "../include/airplay2/airplay_config.h"
 #include <cstdint>
 #include <cstddef>
+#include <memory>
+#include <string>
 #include <vector>
-#include <array>
 
 namespace airplay2 {
 namespace codec {
 
 /*!
- * @brief ALAC "magic cookie" (fmtp data from SDP).
+ * @brief ALAC "magic cookie"（AP2 SETUP 无 fmtp 时用默认值 / SDP fmtp 解析）
  *
- * In AirPlay SDP, the fmtp line contains:
- *   a=fmtp:96 0 16 4096 10 14 2 255 0 0 44100
- * Fields: [0] (unused), [1] bytes-per-sample, [2] max-frame,
- *         [3..9] predictor/lpc params, [10] sample-rate.
+ * AP2 纯音频的编解码参数来自 SETUP stream dict（ct=2/spf/sr），
+ * configure() 时据此构造 ALACSpecificConfig。AirPlay 1 的 ANNOUNCE SDP
+ * fmtp 形如 "0 16 4096 40 10 14 2 255 0 0 44100"，用 parse_alac_fmtp 解析。
  */
 struct AlacMagicCookie {
     int frame_length = 4096;
@@ -51,28 +50,32 @@ struct AlacMagicCookie {
 bool parse_alac_fmtp(const std::string& fmtp, AlacMagicCookie& out);
 
 /*!
- * @brief ALAC frame decoder
+ * @brief ALAC 帧解码器（Apple 官方 ALACDecoder 的薄封装）
+ *
+ * 线程安全：每个会话独立持有实例，实例内状态仅在 receiver 线程访问。
  */
 class AlacDecoder {
 public:
     AlacDecoder();
     ~AlacDecoder();
+    AlacDecoder(const AlacDecoder&) = delete;
+    AlacDecoder& operator=(const AlacDecoder&) = delete;
 
-    /// Initialize decoder from magic cookie
+    /// 用 magic cookie 初始化 Apple 解码器（构造 ALACSpecificConfig）
     bool configure(const AlacMagicCookie& cookie);
 
-    /// Get output config
+    /// 输出格式（sample_rate / channels / PCM16LE）
     const AudioConfig& output_config() const { return out_cfg_; }
 
-    /// Reset predictor state (on seek / flush)
+    /// 复位（seek/flush 时调用；Apple 解码器无跨帧状态，空实现）
     void reset();
 
     /*!
-     * @brief Decode one ALAC frame.
-     * @param data Raw ALAC frame payload (starting with 32-bit header)
-     * @param len  Length in bytes
-     * @param out_pcm Output interleaved PCM buffer (will be resized)
-     * @return bytes consumed, or -1 on error
+     * @brief 解码一帧 ALAC
+     * @param data 已解密的 ALAC 帧负载（不含 RTP 头）
+     * @param len  字节数
+     * @param out_pcm 输出的交错 PCM16LE（自动 resize）
+     * @return 消耗的输入字节数；-1 表示输入非法/未配置
      */
     int64_t decode_frame(const uint8_t* data, size_t len,
                          std::vector<uint8_t>& out_pcm);
@@ -81,36 +84,11 @@ public:
     const AlacMagicCookie& cookie() const { return cookie_; }
 
 private:
-    // Bit reader
-    struct BitReader {
-        const uint8_t* base = nullptr;
-        size_t total = 0;
-        size_t pos_bits = 0;
-
-        void init(const uint8_t* d, size_t n) { base = d; total = n; pos_bits = 0; }
-        uint32_t read(unsigned nbits);
-        uint32_t peek(unsigned nbits) const;
-        void     skip(unsigned nbits) { pos_bits += nbits; }
-        size_t   bytes_used() const { return (pos_bits + 7) >> 3; }
-        int      bits_left() const { return (int)(total * 8 - pos_bits); }
-    };
-
-    static int rice_decompress(BitReader& br, int k, int32_t* samples, int count,
-                                int mod_shift, int max_samples);
-    void decode_channel(BitReader& br, int32_t* out, int samples,
-                        int predictor_num, int m, uint32_t* lpc_coefs,
-                        int chan_bits, int chan_history);
-    static int32_t idiv_shift(int32_t a, int shift);
-
+    struct Impl;
+    std::unique_ptr<Impl> impl_;   ///< Apple ALACDecoder 实例（pimpl 隔离头文件依赖）
     bool configured_ = false;
     AlacMagicCookie cookie_;
     AudioConfig out_cfg_;
-
-    // Predictor history (per channel)
-    static constexpr int kMaxChannels = 2;
-    static constexpr int kMaxPredictor = 32;
-    std::array<std::array<int32_t, kMaxPredictor>, kMaxChannels> predictor_buf_;
-    std::array<int, kMaxChannels> predictor_used_;
 };
 
 } // namespace codec

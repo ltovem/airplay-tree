@@ -262,6 +262,16 @@ void SessionImpl::on_rtp_packet(const net::RtpAudioPacket& pkt) {
         // UxPlay：ALAC 流开始时会先发几个 44 字节包（12B RTP 头 + 32B 加密负载），
         // 解密后是 ALAC 格式信息而非音频数据，必须跳过，否则解码器会报错刷屏。
         if (pkt.payload.size() == 32) return;
+        // 临时调试：打印首个真实 ALAC 帧解密后的前 32 字节，核对解密是否成功
+        // （合法 ALAC 帧应以元素 tag + 帧头出现；全随机字节 = 密钥/IV 错误）。
+        if (alac_debug_dump_++ < 2 && pkt.payload.size() > 32) {
+            char hex[97];
+            size_t n = pkt.payload.size() < 32 ? pkt.payload.size() : 32;
+            for (size_t i = 0; i < n; ++i)
+                std::snprintf(hex + i * 2, sizeof(hex) - i * 2, "%02x", pkt.payload[i]);
+            AP2_LOGI("session %lu: ALAC first frame payload[%zu] head=%s",
+                     (unsigned long)id_, pkt.payload.size(), hex);
+        }
         int64_t used = alac_.decode_frame(pkt.payload.data(), pkt.payload.size(), pcm);
         if (used < 0) {
             AP2_LOGW("session %lu: alac decode failed", (unsigned long)id_);

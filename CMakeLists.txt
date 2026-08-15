@@ -64,6 +64,13 @@ set(AIRPLAY2_SOURCES
     src/codec/alac_decoder.cpp
     src/codec/audio_buffer.cpp
     src/codec/nal_reassembler.cpp
+    # Apple 官方开源 ALAC 解码器（macosforge/alac，Apache-2.0，vendored）
+    src/codec/alac/ALACDecoder.cpp
+    src/codec/alac/ALACBitUtilities.c
+    src/codec/alac/ag_dec.c
+    src/codec/alac/dp_dec.c
+    src/codec/alac/matrix_dec.c
+    src/codec/alac/EndianPortable.c
     src/crypto/aes_ctr.cpp
     src/crypto/aes_cbc.cpp
     src/crypto/sha512.cpp
