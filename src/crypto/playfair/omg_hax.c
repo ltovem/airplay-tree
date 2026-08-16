@@ -1,3 +1,23 @@
+/*!
+ * @file omg_hax.c
+ * @brief PlayFair 白盒 AES 核心实现（vendored，FairPlay SAP 密钥解密用）
+ *
+ * 来自 AirPlay 2 逆向社区（PlayFair 工具），与 fairplay_sap.cpp 配合：
+ *   fairplay_sap_decrypt() 的完整调用链：
+ *     generate_session_key(default_sap, keymsg) -> sap_hash/modified_md5
+ *     generate_key_schedule(sap_key) -> 白盒 AES 密钥扩展
+ *     cycle(block, key_schedule)      -> 白盒 AES 一轮解密
+ *     z_xor / x_xor / t_xor           -> 输入/输出混淆层
+ *
+ * 实现要点：
+ *   - 用预计算查找表（table_s1..s4，见 omg_hax.h）替代标准 AES S-box 与
+ *     列混合，密钥/明文被静态打散进表项，属"白盒"（不暴露密钥本身）；
+ *   - decryptMessage / decrypt_key / decrypt_sap 是旧式 FairPlay 消息
+ *     解密辅助（本项目未调用，仅保留完整性）；
+ *   - 全部 printf 被宏静默，仅保留计算路径。
+ *
+ * 原始代码无版权头，来源为公开逆向工程产物，商用/分发前请自行评估。
+ */
 void modified_md5(unsigned char* originalblockIn, unsigned char* keyIn, unsigned char* keyOut);
 void sap_hash(unsigned char* blockIn, unsigned char* keyOut);
 
@@ -9,6 +29,7 @@ void sap_hash(unsigned char* blockIn, unsigned char* keyOut);
 /* 静默化 PlayFair 逆向调试的 print_block/printf 输出 */
 #define printf(...) ((void)0)
 
+/*! 16 字节块逐字节异或：out = a ^ b（CBC 模式块链接用） */
 void xor_blocks(unsigned char* a, unsigned char* b, unsigned char* out)
 {
    for (int i = 0; i < 16; i++)
@@ -16,46 +37,54 @@ void xor_blocks(unsigned char* a, unsigned char* b, unsigned char* out)
 }
 
 
+/*! 用固定混淆密钥 z_key 对输入块逐字节异或（白盒 AES 输出混淆层之一） */
 void z_xor(unsigned char* in, unsigned char* out, int blocks)
 {
    for (int j = 0; j < blocks; j++)
       for (int i = 0; i < 16; i++)
-         out[j*16+i] = in[j*16+i] ^ z_key[i];   
+         out[j*16+i] = in[j*16+i] ^ z_key[i];
 }
 
+/*! 用固定混淆密钥 x_key 对输入块逐字节异或（白盒 AES 输出混淆层之一） */
 void x_xor(unsigned char* in, unsigned char* out, int blocks)
 {
    for (int j = 0; j < blocks; j++)
       for (int i = 0; i < 16; i++)
-         out[j*16+i] = in[j*16+i] ^ x_key[i];   
+         out[j*16+i] = in[j*16+i] ^ x_key[i];
 }
 
-
+/*! 用固定混淆密钥 t_key 对 16 字节块异或（generate_key_schedule 的输入变换） */
 void t_xor(unsigned char* in, unsigned char* out)
 {
    for (int i = 0; i < 16; i++)
-      out[i] = in[i] ^ t_key[i];   
+      out[i] = in[i] ^ t_key[i];
 }
 
+/*! SAP 解密固定初始向量（IV）：decrypt_sap 中 CBC 首块链接用 */
 unsigned char sap_iv[] = {0x2B,0x84,0xFB,0x79,0xDA,0x75,0xB9,0x04,0x6C,0x24,0x73,0xF7,0xD1,0xC4,0xAB,0x0E,0x2B,0x84,0xFB,0x79,0x75,0xB9,0x04,0x6C,0x24,0x73};
 
+/*! SAP 内部密钥材料：作为 generate_key_schedule 的种子（见 decrypt_sap） */
 unsigned char sap_key_material[] = {0xA1, 0x1A, 0x4A, 0x83,
                                     0xF2, 0x7A, 0x75, 0xEE,
                                     0xA2, 0x1A, 0x7D, 0xB8,
                                     0x8D, 0x77, 0x92, 0xAB};
 
+/*! 白盒 AES 密钥扩展的轮常数（代替标准 Rijndael 的 Rcon，含 GF(2^8) 本原元 0x1B） */
 unsigned char index_mangle[] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36, 0x6C};
 
+/*! 在 table_s1 中按 31*i mod 0x28 选取 256 字节表段（密钥扩展的 S-box/轮函数查找表） */
 unsigned char* table_index(int i)
 {
    return &table_s1[((31*i) % 0x28) << 8];
 }
 
+/*! 在 table_s2 中按 97*i mod 144 选取 256 字节表段（decryptMessage 的置换查找表） */
 unsigned char* message_table_index(int i)
 {   
    return &table_s2[(97*i % 144) << 8];   
 }
 
+/*! 调试用：打印 16 字节块（printf 已被宏静默，仅保留函数体结构） */
 void print_block(char* msg, unsigned char* dword)
 {
    printf("%s", msg);
@@ -64,6 +93,8 @@ void print_block(char* msg, unsigned char* dword)
    printf("\n");
 }
 
+/*! 白盒 AES 轮函数中的"置换"阶段：用 table_s3 的 16 个表段对块做扩散
+ *  （等价于解密方向的 SubBytes + ShiftRows），由 cycle() 调用 */
 void permute_block_1(unsigned char* block)
 {
    block[0] = table_s3[block[0]];
@@ -92,14 +123,17 @@ void permute_block_1(unsigned char* block)
    print_block("Permutation complete. Final value of block: ", block); // This looks right to me, at least for decrypt_kernel
 }
 
+/*! 在 table_s4 中按 71*i mod 144 选取 256 字节表段（permute_block_2 的查找表） */
 unsigned char* permute_table_2(unsigned int i)
 {
    return &table_s4[((71 * i) % 144) << 8];
 }
 
+/*! 与 permute_block_1 相同的置换结构，但使用 table_s4 并按轮次 round
+ *  偏移选择表段；在 cycle() 中每轮（round=8..0）调用一次 */
 void permute_block_2(unsigned char* block, int round)
 {
-   // round is 0..8?
+   // round 取值 0..8，决定选取 table_s4 的表段偏移
    printf("Permuting via table2, round %d... (block[0] = %02X)\n", round, block[0]);
    block[0] = permute_table_2(round*16+0)[block[0]];
    block[4] = permute_table_2(round*16+4)[block[4]];
@@ -127,6 +161,12 @@ void permute_block_2(unsigned char* block, int round)
    print_block("Permutation (2) complete. Final value of block: ", block); // This looks right to me, at least for decrypt_kernel
 }
 
+/*!
+ * 白盒 AES 密钥扩展：由 16 字节 SAP 会话密钥生成 11 轮 (4×32bit) 轮密钥。
+ * 等价于标准 Rijndael 密钥扩展，但 S-box/轮常数被静态打散进 table_s1 的
+ * 查找表（table_index 按 31*i mod 0x28 选表段），并在每轮用 index_mangle
+ * 做额外异或混淆——这是 PlayFair 白盒实现的关键一步。
+ */
 // This COULD just be Rijndael key expansion, but with a different set of S-boxes
 void generate_key_schedule(unsigned char* key_material, uint32_t key_schedule[11][4])
 {   
@@ -198,7 +238,9 @@ void generate_key_schedule(unsigned char* key_material, uint32_t key_schedule[11
       print_block("Schedule: ", (unsigned char*)key_schedule[i]);
 }
 
-// This MIGHT just be AES, or some variant thereof.
+/*! 白盒 AES 主轮函数：对 16 字节块执行 9 轮 T 表混合（table_s5..s8 等价
+ *  SubBytes+ShiftRows+MixColumns）+ 轮密钥异或，最后再与第 0 轮密钥异或。
+ *  round 从 9 递减到 1（key_schedule[9]..[1]），是解密方向。 */
 void cycle(unsigned char* block, uint32_t key_schedule[11][4])
 {
    uint32_t ptr1 = 0;
@@ -265,6 +307,9 @@ void cycle(unsigned char* block, uint32_t key_schedule[11][4])
 }
 
 
+/*! 解密 256 字节 SAP 数据：先用固定密钥 sap_key_material 生成轮密钥，
+ *  再按 CBC 模式自后向前逐块 cycle() 解密（每块与前一密文块异或，
+ *  首块与 sap_iv），最后整体经 x_xor 混淆输出。旧式 FairPlay 辅助函数。 */
 void decrypt_sap(unsigned char* sapIn, unsigned char* sapOut)
 {
    uint32_t key_schedule[11][4];
@@ -304,9 +349,13 @@ void decrypt_sap(unsigned char* sapIn, unsigned char* sapOut)
    }
 }
 
+/*! 固定"初始会话密钥"：generate_session_key 的迭代起点，
+ *  也是 decryptMessage / decrypt_key 的密钥调度种子 */
 unsigned char initial_session_key[] = {0xDC, 0xDC, 0xF3, 0xB9, 0x0B, 0x74, 0xDC, 0xFB, 0x86, 0x7F, 0xF7, 0x60, 0x16, 0x72, 0x90, 0x51};
 
 
+/*! 以已解密 SAP 的偏移 8 处 16 字节作密钥，对单个 16 字节密钥块做 CBC
+ *  解密（z_xor 输入 → cycle → 与 iv 异或 → x_xor 混淆）。旧式 FairPlay 辅助。 */
 void decrypt_key(unsigned char* decryptedSap, unsigned char* keyIn, unsigned char* iv, unsigned char* keyOut)
 {
    unsigned char blockIn[16];
@@ -325,6 +374,9 @@ void decrypt_key(unsigned char* decryptedSap, unsigned char* keyIn, unsigned cha
 }
 
 
+/*! 解密 FairPlay 密钥消息（0x80 字节负载 + 头）：mode(0..3) 决定块序与 IV，
+ *  每块做 9 轮 message_table_index+message_key 置换 + table_s9 T 表混合，
+ *  再 table_s10 置换，最后与前一密文块（或 message_iv）异或。旧式辅助函数。 */
 void decryptMessage(unsigned char* messageIn, unsigned char* decryptedMessage)
 {
    unsigned char buffer[16];
@@ -444,12 +496,15 @@ void decryptMessage(unsigned char* messageIn, unsigned char* decryptedMessage)
    }
 }
 
+/*! generate_session_key 拼装 newSap 时使用的两段固定填充（逆向自 PlayFair，
+ *  不得随意改动，否则会话密钥不匹配） */
 unsigned char static_source_1[] = {0xFA, 0x9C, 0xAD, 0x4D, 0x4B, 0x68, 0x26, 0x8C, 0x7F, 0xF3, 0x88, 0x99, 0xDE, 0x92, 0x2E, 0x95, 
                                    0x1E};
 unsigned char static_source_2[] = {0xEC, 0x4E, 0x27, 0x5E, 0xFD, 0xF2, 0xE8, 0x30, 0x97, 0xAE, 0x70, 0xFB, 0xE0, 0x00, 0x3F, 0x1C, 
                                    0x39, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
                                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x09, 0x00, 0x0, 0x00, 0x00, 0x00, 0x00};
 
+/*! 交换两个字节（generate_session_key 收尾处翻转每 32bit 字的字节序） */
 void swap_bytes(unsigned char* a, unsigned char *b)
 {
    unsigned char c = *a;
@@ -457,6 +512,13 @@ void swap_bytes(unsigned char* a, unsigned char *b)
    *b = c;
 }
 
+/*! 由旧 SAP 与 FairPlay keymsg 生成 16 字节会话密钥（SAP 协议核心步骤）：
+ *  1) decryptMessage 解密消息负载；
+ *  2) 拼 static_source_1 + 明文 + oldSap + static_source_2 为 320 字节 newSap；
+ *  3) 以 initial_session_key 为起点，对 5 个 64 字节块交替做 modified_md5
+ *     与 sap_hash 并累加进会话密钥；
+ *  4) 每 32bit 字内字节序翻转，最后整块异或 0x79 得到最终密钥。
+ *  本项目 fairplay_sap_decrypt() 用 default_sap 作为 oldSap 调用本函数。 */
 void generate_session_key(unsigned char* oldSap, unsigned char* messageIn, unsigned char* sessionKey)
 {
    unsigned char decryptedMessage[128];
@@ -519,6 +581,8 @@ void generate_session_key(unsigned char* oldSap, unsigned char* messageIn, unsig
    print_block("Session key computed as: ", sessionKey);
 }
 
+/*! PlayFair 默认 SAP（256 字节）：FairPlay 协议预置的"旧 SAP"。
+ *  本项目仅作为 generate_session_key 的第一个参数使用，与 UxPlay 一致。 */
 unsigned char default_sap[] =
   { 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,
     0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79, 0x79,

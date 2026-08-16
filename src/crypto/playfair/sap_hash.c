@@ -1,3 +1,12 @@
+/*!
+ * @file sap_hash.c
+ * @brief FairPlay SAP 哈希（vendored）：generate_session_key 的混合步骤之一
+ *
+ * 将 64 字节输入块扩展为 210 字节缓冲、做前向/反向 "scramble"（rol/加法/异或），
+ * 再经 hand_garble.c 的 garble() 彻底混淆，最后从 buffer0..buffer3 汇总出
+ * 16 字节输出。由 generate_session_key()（omg_hax.c）与 modified_md5 交替调用。
+ * 逻辑不可变更，任何修改都会破坏会话密钥派生。
+ */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,17 +15,21 @@
 
 void garble(unsigned char*, unsigned char*, unsigned char*, unsigned char*, unsigned char*);
 
+/*! 8bit 循环左移（sap_hash 的 scramble 用） */
 unsigned char rol8(unsigned char input, int count)
 {
    return ((input << count) & 0xff) | (input & 0xff) >> (8-count);
 }
 
+/*! 8bit 循环左移的 32bit 版本（sap_hash 的索引计算用） */
 uint32_t rol8x(unsigned char input, int count)
 {
    return ((input << count)) | (input) >> (8-count);
 }
 
 
+/*! SAP 哈希核心：见文件头。blockIn 为 64 字节输入，keyOut 输出 16 字节。
+ *  内部固定缓冲 buffer0/buffer2/buffer4 与索引表 i0_index 均为逆向常量。 */
 void sap_hash(unsigned char* blockIn, unsigned char* keyOut)
 {
    uint32_t* block_words = (uint32_t*)blockIn;

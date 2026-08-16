@@ -1,3 +1,12 @@
+/*!
+ * @file hand_garble.c
+ * @brief PlayFair 白盒 AES 的 "garble" 混淆步骤（vendored，逆向自 AirPlay 2）
+ *
+ * 由 sap_hash() 调用（见 sap_hash.c）：对 5 个内部缓冲做大量看似无关的
+ * 算术/位运算，把输入数据彻底打散后写入 buffer0..buffer3。
+ * 原作者也承认"不知道具体在做什么，但输出是正确的"——这是 SAP 会话密钥
+ * 派生中必不可少的白盒混淆层，任何改动都会导致密钥不匹配，请勿修改逻辑。
+ */
 #include <stdint.h>
 #include <stdio.h>
 
@@ -6,6 +15,7 @@
 uint8_t rol8(uint8_t x, int y);
 uint32_t rol8x(uint8_t x, int y);
 
+/*! 8bit 循环右移的 32bit 包装（count==0 时按原作者意图返回 0，勿改） */
 uint32_t weird_ror8(uint8_t input, int count)
 {
    if (count == 0)
@@ -14,6 +24,7 @@ uint32_t weird_ror8(uint8_t input, int count)
       
 }
 
+/*! 8bit 循环左移的 32bit 包装（count==0 时返回 0） */
 uint32_t weird_rol8(uint8_t input, int count)
 {
    if (count == 0)
@@ -21,6 +32,7 @@ uint32_t weird_rol8(uint8_t input, int count)
    return ((input << count) & 0xff) | (input & 0xff) >> (8-count);      
 }
 
+/*! 8bit 值左移后异或右移部分（garble 中的索引计算用，count==0 返回 0） */
 uint32_t weird_rol32(uint8_t input, int count)
 {
    if (count == 0)
@@ -28,6 +40,10 @@ uint32_t weird_rol32(uint8_t input, int count)
    return (input << count) ^ (input >> (8 - count));
 }
 
+/*! 核心混淆函数：对 buffer0..buffer4 做约 100 步混合运算。
+ *  buffer1 是 210 字节输入数据（sap_hash 的中间态），buffer0/buffer2/buffer4
+ *  是固定常量缓冲，buffer3 是 132 字节输出区。结果随后被 sap_hash 汇总成
+ *  最终密钥字节。原作者注释（见下）表示该过程难以逆向，逻辑不可变更。 */
 // I do not know why it is doing all of this, and there is still a possibility for a gremlin or two to be lurking in the background
 // I DO know it is not trivial. It could be purely random garbage, of course.
 void garble(unsigned char* buffer0, unsigned char* buffer1, unsigned char* buffer2, unsigned char* buffer3, unsigned char* buffer4)

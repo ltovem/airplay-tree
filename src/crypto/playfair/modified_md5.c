@@ -1,3 +1,14 @@
+/*!
+ * @file modified_md5.c
+ * @brief 修改版 MD5（vendored，FairPlay SAP 会话密钥派生用）
+ *
+ * 与标准 MD5 相似（F/G/H/I 轮函数、移位表、sin 常量），但有三处关键改动：
+ *   - 中间（i==31 后）按 A/B/C/D 的值对块字做 5 次交换（swap），破坏标准结构；
+ *   - 输入块以字节方式直接组装 32bit 字（小端）；
+ *   - 输出为 4 个字与初始链值相加（mod 2^32），不再追加长度填充。
+ * 由 generate_session_key() 调用（见 omg_hax.c），用于混合 SAP 会话密钥。
+ * 逻辑不可变更，任何修改都会导致 FairPlay 密钥解密失败。
+ */
 #include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
@@ -6,37 +17,44 @@
 #include <string.h>
 #define printf(...) (void)0;
 
+/*! MD5 每轮循环左移位数表（64 项，与标准 MD5 相同） */
 int shift[] = {7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
                5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
                4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
                6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
 
+/*! MD5 轮函数 F：B·C + ~B·D */
 uint32_t F(uint32_t B, uint32_t C, uint32_t D)
 {
    return (B & C) | (~B & D);
 }
 
+/*! MD5 轮函数 G：B·D + C·~D */
 uint32_t G(uint32_t B, uint32_t C, uint32_t D)
 {
    return (B & D) | (C & ~D);
 }
 
+/*! MD5 轮函数 H：B⊕C⊕D */
 uint32_t H(uint32_t B, uint32_t C, uint32_t D)
 {
    return B ^ C ^ D;
 }
 
+/*! MD5 轮函数 I：C⊕(B|~D) */
 uint32_t I(uint32_t B, uint32_t C, uint32_t D)
 {
    return C ^ (B | ~D);
 }
 
 
+/*! 32bit 循环左移（标准 MD5 的 rol） */
 uint32_t rol(uint32_t input, int count)
 {
    return ((input << count) & 0xffffffff) | (input & 0xffffffff) >> (32-count);
 }
 
+/*! 交换两个 32bit 字（modified_md5 中间的特殊扰动步骤，标准 MD5 没有） */
 void swap(uint32_t* a, uint32_t* b)
 {
    printf("%08x <-> %08x\n", *a, *b);
@@ -45,6 +63,8 @@ void swap(uint32_t* a, uint32_t* b)
    *b = c;
 }
 
+/*! 修改版 MD5：对 64 字节输入块以 keyIn 为初始链值迭代 64 轮，
+ *  输出 keyOut（4 字相加）。详见文件头说明。 */
 void modified_md5(unsigned char* originalblockIn, unsigned char* keyIn, unsigned char* keyOut)
 {
    unsigned char blockIn[64];
