@@ -81,3 +81,9 @@ logs/
 scratch/
 *.apk
 *.pcap
+
+# ---- Android 构建产物 / 本地配置（勿提交）----
+android/local.properties
+android/.gradle/
+android/app/.cxx/
+android/app/build/
